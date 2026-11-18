@@ -71,6 +71,7 @@ import { registerTeacherAndLevel2Routes } from './server/teacherRoutes';
 import { registerWorldExperienceRoutes } from './server/worldExperienceRoutes';
 import {
   checkPgHealth,
+  checkPgHealthDetailed,
   checkRateLimitPg,
   clearRateLimitPg,
   enqueuePgContextSave,
@@ -231,13 +232,23 @@ async function startServer() {
   }
 
   app.get('/api/health', async (_req, res) => {
-    const healthy = await checkPgHealth();
-    if (!healthy) {
-      return res.status(503).json({ status: 'error', database: 'unavailable' });
+    const health = await checkPgHealthDetailed();
+    if (!health.healthy) {
+      return res.status(503).json({
+        status: 'error',
+        database: 'unavailable',
+        code: 'DB_UNAVAILABLE',
+        reason: health.reason || 'connection_failed',
+        missingEnvVars: health.missingEnvVars,
+        sslEnabled: health.sslEnabled,
+        schemaReady: health.schemaReady,
+      });
     }
     res.json({
       status: 'ok',
-      database: shouldUsePgOrFailClosed() ? 'postgresql' : 'in-memory-dev',
+      database: health.database,
+      sslEnabled: health.sslEnabled,
+      schemaReady: health.schemaReady,
     });
   });
 
@@ -2285,6 +2296,27 @@ async function startServer() {
     assertChildAccess,
   });
 
+  app.use(
+    '/api',
+    (
+      err: unknown,
+      _req: express.Request,
+      res: express.Response,
+      _next: express.NextFunction,
+    ) => {
+      console.error('Unhandled /api error:', (err as Error)?.message || err);
+      if (res.headersSent) return;
+      const msg = String((err as Error)?.message || '');
+      if (/postgres|database|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|SSL|28P01|42P01/i.test(msg)) {
+        return res.status(503).json({
+          error: 'Database unavailable. Failing closed for data safety.',
+          code: 'DB_UNAVAILABLE',
+        });
+      }
+      return res.status(500).json({ error: 'Internal server error.' });
+    },
+  );
+
   if (!IS_PROD && process.env.SKIP_VITE !== '1') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -2301,6 +2333,17 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`NonoLand server listening on http://0.0.0.0:${PORT}`);
+    void checkPgHealthDetailed().then((health) => {
+      if (health.healthy) {
+        console.log(
+          `[Startup DB] backend=${health.database} ssl=${health.sslEnabled} neon=${health.isNeonHost} pooled=${health.isPooledEndpoint} schemaReady=${health.schemaReady}`,
+        );
+      } else {
+        console.error(
+          `[Startup DB] UNAVAILABLE (fail-closed active): reason=${health.reason} missingEnvVars=${(health.missingEnvVars || []).join(',') || 'none'} ssl=${health.sslEnabled} schemaReady=${health.schemaReady}`,
+        );
+      }
+    });
   });
 }
 

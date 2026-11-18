@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import fs from 'node:fs';
 import path from 'node:path';
 import { eq, inArray, sql } from 'drizzle-orm';
-import { db as pgDb, pool } from '../src/db/index.ts';
+import { db as pgDb, getPgConnectionDiagnostics, pool } from '../src/db/index.ts';
 import * as schema from '../src/db/schema.ts';
 import { DEFAULT_FEATURE_FLAGS } from '../src/utils/validation.ts';
 import { migrateChildProfileSafely } from '../src/utils/ageAdaptation.ts';
@@ -133,15 +133,20 @@ export function getDefaultServerDb(): ServerDb {
 }
 
 let inMemoryDb: ServerDb | null = null;
+let devSeedLoaded = false;
+const devSeedIds = {
+  users: new Set<string>(),
+  families: new Set<string>(),
+  children: new Set<string>(),
+  classes: new Set<string>(),
+  teacherExams: new Set<string>(),
+  securityLogs: new Set<string>(),
+};
 const inMemoryRateLimits = new Map<string, number[]>();
 let inMemoryLockChain: Promise<unknown> = Promise.resolve();
 
 export function isPgConfigured(): boolean {
-  return Boolean(
-    process.env.SQL_HOST?.trim() &&
-      process.env.SQL_DB_NAME?.trim() &&
-      process.env.SQL_USER?.trim(),
-  );
+  return getPgConnectionDiagnostics().configured;
 }
 
 export function shouldUsePgOrFailClosed(): boolean {
@@ -150,7 +155,8 @@ export function shouldUsePgOrFailClosed(): boolean {
   if (
     process.env.SQL_HOST?.trim() ||
     process.env.SQL_DB_NAME?.trim() ||
-    process.env.SQL_USER?.trim()
+    process.env.SQL_USER?.trim() ||
+    process.env.DATABASE_URL?.trim()
   ) {
     return true;
   }
@@ -159,6 +165,21 @@ export function shouldUsePgOrFailClosed(): boolean {
 
 function allowDevInMemoryFallback(): boolean {
   return !shouldUsePgOrFailClosed();
+}
+
+export function getDbStorageInfo() {
+  const usingPg = shouldUsePgOrFailClosed();
+  return {
+    storageBackend: usingPg ? ('postgresql' as const) : ('in-memory-dev' as const),
+    devSeedEnabled: !usingPg && devSeedLoaded,
+    isDevSeedRecord: (
+      collection: 'users' | 'families' | 'children' | 'classes' | 'teacherExams' | 'securityLogs',
+      id: string,
+    ): boolean => {
+      if (usingPg || !devSeedLoaded) return false;
+      return devSeedIds[collection].has(id);
+    },
+  };
 }
 
 function getInMemoryDb(): ServerDb {
@@ -170,9 +191,18 @@ function getInMemoryDb(): ServerDb {
   }
 
   let loaded: ServerDb | null = null;
+  devSeedLoaded = false;
+  devSeedIds.users.clear();
+  devSeedIds.families.clear();
+  devSeedIds.children.clear();
+  devSeedIds.classes.clear();
+  devSeedIds.teacherExams.clear();
+  devSeedIds.securityLogs.clear();
+
   const seedPath = path.resolve(process.cwd(), 'data', 'nonoland-server-db.json');
+  const skipDevSeed = process.env.DISABLE_DEV_SEED === 'true';
   try {
-    if (fs.existsSync(seedPath)) {
+    if (!skipDevSeed && fs.existsSync(seedPath)) {
       const raw = fs.readFileSync(seedPath, 'utf-8');
       const parsed = JSON.parse(raw) as Partial<ServerDb>;
       const defaults = getDefaultServerDb();
@@ -191,7 +221,18 @@ function getInMemoryDb(): ServerDb {
           lastErrors: parsed.operationalMetrics?.lastErrors || [],
         },
       };
-      console.log('[Dev Mode] PostgreSQL not configured — using explicit dev in-memory store seeded from data/nonoland-server-db.json');
+      devSeedLoaded = true;
+      for (const id of Object.keys(parsed.users || {})) devSeedIds.users.add(id);
+      for (const id of Object.keys(parsed.families || {})) devSeedIds.families.add(id);
+      for (const id of Object.keys(parsed.children || {})) devSeedIds.children.add(id);
+      for (const id of Object.keys(parsed.classes || {})) devSeedIds.classes.add(id);
+      for (const id of Object.keys(parsed.teacherExams || {})) devSeedIds.teacherExams.add(id);
+      for (const log of parsed.securityLogs || []) {
+        if (log?.id) devSeedIds.securityLogs.add(log.id);
+      }
+      console.log(
+        '[Dev Mode] PostgreSQL not configured — using explicit dev in-memory store with read-only seed baseline from data/nonoland-server-db.json (seed records separated from real stats).',
+      );
     }
   } catch (err) {
     console.warn('[Dev Mode] Could not load data/nonoland-server-db.json — starting with empty dev in-memory DB:', err);
@@ -211,21 +252,106 @@ function getInMemoryDb(): ServerDb {
   return inMemoryDb;
 }
 
-export async function checkPgHealth(): Promise<boolean> {
+export interface PgHealthDetails {
+  healthy: boolean;
+  database: 'postgresql' | 'in-memory-dev' | 'unavailable';
+  reason?: 'missing_env_vars' | 'connection_failed' | 'schema_not_initialized';
+  missingEnvVars?: string[];
+  sslEnabled: boolean;
+  isNeonHost: boolean;
+  isPooledEndpoint: boolean;
+  schemaReady: boolean;
+  errorCode?: string;
+}
+
+export async function checkPgHealthDetailed(): Promise<PgHealthDetails> {
   if (allowDevInMemoryFallback()) {
     getInMemoryDb();
-    return true;
+    return {
+      healthy: true,
+      database: 'in-memory-dev',
+      sslEnabled: false,
+      isNeonHost: false,
+      isPooledEndpoint: false,
+      schemaReady: true,
+    };
   }
-  if (!isPgConfigured()) {
-    return false;
+
+  const diag = getPgConnectionDiagnostics();
+  if (!diag.configured) {
+    return {
+      healthy: false,
+      database: 'unavailable',
+      reason: 'missing_env_vars',
+      missingEnvVars: diag.missingEnvVars,
+      sslEnabled: diag.sslEnabled,
+      isNeonHost: diag.isNeonHost,
+      isPooledEndpoint: diag.isPooledEndpoint,
+      schemaReady: false,
+    };
   }
+
   try {
     await pool.query('SELECT 1');
-    return true;
   } catch (err) {
-    console.error('PostgreSQL health check failed:', err);
-    return false;
+    const safeErr = err as { code?: string; message?: string };
+    console.error(`PostgreSQL connectivity check failed [${safeErr?.code || 'CONN_ERROR'}]:`, safeErr?.message || 'Unknown connection error');
+    return {
+      healthy: false,
+      database: 'unavailable',
+      reason: 'connection_failed',
+      sslEnabled: diag.sslEnabled,
+      isNeonHost: diag.isNeonHost,
+      isPooledEndpoint: diag.isPooledEndpoint,
+      schemaReady: false,
+      errorCode: safeErr?.code || 'CONN_ERROR',
+    };
   }
+
+  try {
+    const tableCheck = await pool.query<{ users_table: string | null }>(
+      "SELECT to_regclass('public.users') AS users_table",
+    );
+    const schemaReady = Boolean(tableCheck.rows?.[0]?.users_table);
+    if (!schemaReady) {
+      console.error('PostgreSQL connected, but required table public.users is missing (migrations not applied).');
+      return {
+        healthy: false,
+        database: 'unavailable',
+        reason: 'schema_not_initialized',
+        sslEnabled: diag.sslEnabled,
+        isNeonHost: diag.isNeonHost,
+        isPooledEndpoint: diag.isPooledEndpoint,
+        schemaReady: false,
+      };
+    }
+    return {
+      healthy: true,
+      database: 'postgresql',
+      sslEnabled: diag.sslEnabled,
+      isNeonHost: diag.isNeonHost,
+      isPooledEndpoint: diag.isPooledEndpoint,
+      schemaReady: true,
+    };
+  } catch (err) {
+    const safeErr = err as { code?: string; message?: string };
+    console.error(`PostgreSQL schema check failed [${safeErr?.code || 'SCHEMA_ERROR'}]:`, safeErr?.message || 'Unknown schema error');
+    return {
+      healthy: false,
+      database: 'unavailable',
+      reason: 'connection_failed',
+      sslEnabled: diag.sslEnabled,
+      isNeonHost: diag.isNeonHost,
+      isPooledEndpoint: diag.isPooledEndpoint,
+      schemaReady: false,
+      errorCode: safeErr?.code || 'SCHEMA_ERROR',
+    };
+  }
+}
+
+export async function checkPgHealth(): Promise<boolean> {
+  const details = await checkPgHealthDetailed();
+  return details.healthy;
 }
 
 export async function checkRateLimitPg(

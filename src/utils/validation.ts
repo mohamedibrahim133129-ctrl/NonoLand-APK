@@ -697,4 +697,58 @@ export function checkQuestionQuality(
   return flags;
 }
 
+export function validateStrictAdminPassword(
+  raw: unknown,
+  email?: string,
+  displayName?: string,
+): { ok: boolean; error?: string } {
+  const base = validatePassword(raw, email, displayName);
+  if (!base.ok) return base;
+  const str = String(raw);
+  if (!/[a-z]/.test(str)) {
+    return {
+      ok: false,
+      error: 'Admin password must include at least one lowercase English letter (a-z).',
+    };
+  }
+  if (!/[A-Z]/.test(str)) {
+    return {
+      ok: false,
+      error: 'Admin password must include at least one uppercase English letter (A-Z).',
+    };
+  }
+  if (!/\d/.test(str)) {
+    return {
+      ok: false,
+      error: 'Admin password must include at least one number (0-9).',
+    };
+  }
+  if (!/[^A-Za-z0-9\s]/.test(str)) {
+    return {
+      ok: false,
+      error: 'Admin password must include at least one special symbol (e.g. !@#$%).',
+    };
+  }
+  return { ok: true };
+}
 
+export function formatApiErrorMessage(
+  status: number,
+  data: { error?: string; code?: string } | null | undefined,
+  language: Language,
+  fallbackEn: string,
+  fallbackAr: string,
+): string {
+  const code = data?.code || '';
+  const rawErr = data?.error || '';
+  if (
+    code === 'DB_UNAVAILABLE' ||
+    code === 'DB_COMMIT_FAILED' ||
+    (status === 503 && /database unavailable|database commit failed/i.test(rawErr))
+  ) {
+    return language === 'ar'
+      ? 'قاعدة البيانات غير متاحة حالياً. تم إيقاف العملية لحماية سلامة البيانات، يرجى التحقق من اتصال قاعدة البيانات والمحاولة مرة أخرى.'
+      : 'Database unavailable. Operation paused safely to protect data integrity. Please verify database connectivity and retry.';
+  }
+  return rawErr || (language === 'ar' ? fallbackAr : fallbackEn);
+}

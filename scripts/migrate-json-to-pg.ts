@@ -8,7 +8,12 @@ import type { ServerDb } from '../server/dbTypes.ts';
 import { DEFAULT_LEARNING_GARDEN_STATE, sanitizeLearningGarden } from '../src/data/gardenCatalog.ts';
 
 const SOURCE_JSON_PATH = path.resolve(process.cwd(), 'data/nonoland-server-db.json');
-const MIGRATION_SQL_PATH = path.resolve(process.cwd(), 'drizzle/0000_right_gwen_stacy.sql');
+const DRIZZLE_DIR = path.resolve(process.cwd(), 'drizzle');
+const MIGRATION_SQL_FILE = fs.existsSync(DRIZZLE_DIR)
+  ? fs.readdirSync(DRIZZLE_DIR).filter((f) => f.endsWith('.sql')).sort()[0] || '0000_clear_maddog.sql'
+  : '0000_clear_maddog.sql';
+const MIGRATION_SQL_PATH = path.resolve(DRIZZLE_DIR, MIGRATION_SQL_FILE);
+const MIGRATION_VERSION = MIGRATION_SQL_FILE.replace(/\.sql$/, '');
 
 async function getPgCounts() {
   const tables = [
@@ -1133,7 +1138,7 @@ async function main() {
     await tx
       .insert(schema.schemaMigrations)
       .values({
-        version: '0000_right_gwen_stacy',
+        version: MIGRATION_VERSION,
         description: 'Initial normalized PostgreSQL schema + NonoLand JSON migration',
         checksum: migrationChecksum,
         appliedAt: nowIso,

@@ -6,17 +6,19 @@ import {
   validateEmail,
   validateParentName,
   validatePassword,
+  validateStrictAdminPassword,
 } from '../src/utils/validation';
 import type { AccountStatus, UserRole } from '../src/types/nonoland';
 import { recordAuditEvent } from './auditLog';
 import type { AuthenticatedRequest, ServerDb } from './dbTypes';
-import { checkRateLimitPg, runWithPgDbLock } from './pgStore';
+import { checkRateLimitPg, getDbStorageInfo, runWithPgDbLock } from './pgStore';
 import {
   appendSecurityLog,
   getClientIp,
   hashPassword,
   isAdminRole,
   StoredUserRecord,
+  verifyPassword,
   verifySecretTimingSafe,
 } from './security';
 
@@ -256,17 +258,39 @@ export function registerAdminRoutes(deps: AdminRoutesDeps): void {
       }
     }
 
+    const storageInfo = getDbStorageInfo();
     const users = Object.values(db.users);
-    const teachers = users.filter((u) => u.role === 'teacher');
-    const parents = users.filter((u) => u.role === 'parent');
-    const admins = users.filter((u) => isAdminRole(u.role));
-    const classes = Object.values(db.classes);
+    const realUsers = users.filter((u) => !storageInfo.isDevSeedRecord('users', u.id));
+    const seedUsers = users.filter((u) => storageInfo.isDevSeedRecord('users', u.id));
+
+    const teachers = realUsers.filter((u) => u.role === 'teacher');
+    const parents = realUsers.filter((u) => u.role === 'parent');
+    const admins = realUsers.filter((u) => isAdminRole(u.role));
+    const realFamilies = Object.keys(db.families || {}).filter((id) => !storageInfo.isDevSeedRecord('families', id));
+    const realChildren = Object.keys(db.children || {}).filter((id) => !storageInfo.isDevSeedRecord('children', id));
+    const classes = Object.values(db.classes || {}).filter((c) => !storageInfo.isDevSeedRecord('classes', c.id));
+    const exams = Object.values(db.teacherExams || {}).filter((e) => !storageInfo.isDevSeedRecord('teacherExams', e.id));
+    const realAuditLogsCount = db.securityLogs.filter((l) => !storageInfo.isDevSeedRecord('securityLogs', l.id)).length;
+
+    const seedStats = storageInfo.devSeedEnabled
+      ? {
+          totalParents: seedUsers.filter((u) => u.role === 'parent').length,
+          totalFamilies: Object.keys(db.families || {}).filter((id) => storageInfo.isDevSeedRecord('families', id)).length,
+          totalChildren: Object.keys(db.children || {}).filter((id) => storageInfo.isDevSeedRecord('children', id)).length,
+          totalTeachers: seedUsers.filter((u) => u.role === 'teacher').length,
+          totalClasses: Object.values(db.classes || {}).filter((c) => storageInfo.isDevSeedRecord('classes', c.id)).length,
+          totalExams: Object.values(db.teacherExams || {}).filter((e) => storageInfo.isDevSeedRecord('teacherExams', e.id)).length,
+          auditLogsCount: db.securityLogs.filter((l) => storageInfo.isDevSeedRecord('securityLogs', l.id)).length,
+        }
+      : null;
 
     res.json({
+      storageBackend: storageInfo.storageBackend,
+      devSeedEnabled: storageInfo.devSeedEnabled,
       stats: {
         totalParents: parents.length,
-        totalFamilies: Object.keys(db.families || {}).length || parents.length,
-        totalChildren: Object.keys(db.children).length,
+        totalFamilies: realFamilies.length || parents.length,
+        totalChildren: realChildren.length,
         totalTeachers: teachers.length,
         pendingTeachers: teachers.filter((t) => t.status === 'pending').length,
         activeTeachers: teachers.filter((t) => t.status === 'active').length,
@@ -274,9 +298,11 @@ export function registerAdminRoutes(deps: AdminRoutesDeps): void {
         suspendedTeachers: teachers.filter((t) => t.status === 'suspended').length,
         totalClasses: classes.length,
         activeClasses: classes.filter((c) => c.active).length,
-        auditLogsCount: db.securityLogs.length,
+        totalExams: exams.length,
+        auditLogsCount: realAuditLogsCount,
         adminCount: admins.length,
       },
+      seedStats,
     });
   });
 
@@ -503,6 +529,7 @@ export function registerAdminRoutes(deps: AdminRoutesDeps): void {
   // =========================================================================
   app.get('/api/admin/parents', requireAdminPermission('manage_parents'), (_req, res) => {
     const db = getDb();
+    const storageInfo = getDbStorageInfo();
     const parents = Object.values(db.users)
       .filter((u) => u.role === 'parent')
       .map((parent) => {
@@ -515,6 +542,7 @@ export function registerAdminRoutes(deps: AdminRoutesDeps): void {
             language: ch.language,
             level: ch.level,
             stars: ch.stars,
+            isDevSeed: storageInfo.isDevSeedRecord('children', ch.id),
           }));
         return {
           id: parent.id,
@@ -526,6 +554,7 @@ export function registerAdminRoutes(deps: AdminRoutesDeps): void {
           createdAt: parent.createdAt,
           childrenCount: linkedChildren.length,
           children: linkedChildren,
+          isDevSeed: storageInfo.isDevSeedRecord('users', parent.id),
         };
       })
       .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
@@ -563,16 +592,20 @@ export function registerAdminRoutes(deps: AdminRoutesDeps): void {
 
   app.get('/api/admin/admins', requireStrictSuperAdmin, (_req, res) => {
     const db = getDb();
+    const storageInfo = getDbStorageInfo();
     const admins = Object.values(db.users)
       .filter((u) => isAdminRole(u.role))
-      .map((u) => toSafeUser(u));
+      .map((u) => ({
+        ...toSafeUser(u),
+        isDevSeed: storageInfo.isDevSeedRecord('users', u.id),
+      }));
     res.json({ admins });
   });
 
   app.post('/api/admin/admins', requireStrictSuperAdmin, async (req: AuthenticatedRequest, res) => {
-    const db = getDb();
+    const actorUser = req.authSession!.user;
     const ip = getClientIp(req);
-    if (!(await checkRateLimitPg(`admin-create:${req.authSession!.user.id}`, 15, 15 * 60_000))) {
+    if (!(await checkRateLimitPg(`admin-create:${actorUser.id}`, 15, 15 * 60_000))) {
       return res.status(429).json({ error: 'Too many admin creation attempts.' });
     }
 
@@ -580,17 +613,15 @@ export function registerAdminRoutes(deps: AdminRoutesDeps): void {
       displayName?: string;
       email?: string;
       password?: string;
+      confirmPassword?: string;
+      creatorCurrentPassword?: string;
       role?: UserRole;
     };
 
-    const targetRole: UserRole = body.role && ASSIGNABLE_SUBORDINATE_ADMIN_ROLES.includes(body.role)
-      ? body.role
-      : 'admin';
-
-    if (body.role === 'super_admin') {
-      return res.status(403).json({
-        error: 'Cannot create additional Super Admin accounts via this endpoint.',
-      });
+    const allowedRoles: UserRole[] = ['super_admin', ...ASSIGNABLE_SUBORDINATE_ADMIN_ROLES];
+    const requestedRole = body.role || 'admin';
+    if (!allowedRoles.includes(requestedRole)) {
+      return res.status(400).json({ error: 'Invalid administrator role requested.' });
     }
 
     const nameCheck = validateParentName(body.displayName || '');
@@ -599,49 +630,123 @@ export function registerAdminRoutes(deps: AdminRoutesDeps): void {
     const emailCheck = validateEmail(body.email || '');
     if (!emailCheck.ok) return res.status(400).json({ error: emailCheck.error });
 
-    if (db.emailIndex[emailCheck.normalized]) {
-      return res.status(409).json({ error: 'An account with this email already exists.' });
+    if (requestedRole === 'super_admin' || body.confirmPassword !== undefined) {
+      if (typeof body.confirmPassword !== 'string' || body.password !== body.confirmPassword) {
+        return res.status(400).json({ error: 'Password and password confirmation do not match.' });
+      }
     }
 
-    const pwCheck = validatePassword(body.password || '', emailCheck.normalized, nameCheck.clean);
+    const pwCheck =
+      requestedRole === 'super_admin'
+        ? validateStrictAdminPassword(body.password || '', emailCheck.normalized, nameCheck.clean)
+        : validatePassword(body.password || '', emailCheck.normalized, nameCheck.clean);
     if (!pwCheck.ok) return res.status(400).json({ error: pwCheck.error });
 
-    const nowIso = new Date().toISOString();
-    const userId = `adm_${crypto.randomBytes(6).toString('hex')}`;
-    const adminUser: StoredUserRecord = {
-      id: userId,
-      email: (body.email || '').trim(),
-      normalizedEmail: emailCheck.normalized,
-      displayName: nameCheck.clean,
-      passwordHash: hashPassword(body.password || ''),
-      role: targetRole,
-      emailVerified: true,
-      status: 'active',
-      policyVersion: POLICY_VERSION,
-      termsAcceptedAt: nowIso,
-      failedLoginAttempts: 0,
-      createdAt: nowIso,
-      updatedAt: nowIso,
-    };
+    if (requestedRole === 'super_admin') {
+      if (typeof body.creatorCurrentPassword !== 'string' || !body.creatorCurrentPassword) {
+        return res.status(400).json({
+          error: 'Current Super Admin password confirmation is required to create a Super Admin account.',
+        });
+      }
+    }
 
-    db.users[userId] = adminUser;
-    db.emailIndex[emailCheck.normalized] = userId;
+    try {
+      const outcome = await runWithPgDbLock(`admin-create:${emailCheck.normalized}`, async (lockedDb) => {
+        const freshActor = lockedDb.users[actorUser.id];
+        if (!freshActor || freshActor.role !== 'super_admin' || freshActor.status !== 'active') {
+          return {
+            ok: false as const,
+            status: 403,
+            payload: { error: 'Forbidden: Active Super Administrator session required.' },
+          };
+        }
 
-    recordAuditEvent(db, {
-      eventType: 'ADMIN_ACTION',
-      actorId: req.authSession!.user.id,
-      actorRole: req.authSession!.user.role,
-      actionType: 'ADMIN_ACCOUNT_CREATED',
-      recordType: 'user',
-      recordId: userId,
-      newValue: `${emailCheck.normalized}:${targetRole}`,
-      outcome: 'success',
-      ip,
-      summary: `Super Admin created ${targetRole} account (${emailCheck.normalized})`,
-    });
-    saveDb(db);
+        if (requestedRole === 'super_admin' || body.creatorCurrentPassword !== undefined) {
+          const okCreatorPw = verifyPassword(body.creatorCurrentPassword || '', freshActor.passwordHash);
+          if (!okCreatorPw) {
+            appendSecurityLog(lockedDb.securityLogs, {
+              eventType: 'ACCESS_DENIED',
+              actorId: freshActor.id,
+              role: freshActor.role,
+              ip,
+              summary: `Invalid creator password confirmation while creating ${requestedRole} (${emailCheck.normalized})`,
+            });
+            return {
+              ok: false as const,
+              status: 403,
+              payload: { error: 'Current Super Admin password verification failed.' },
+            };
+          }
+        }
 
-    res.status(201).json({ admin: toSafeUser(adminUser) });
+        if (lockedDb.emailIndex[emailCheck.normalized]) {
+          return {
+            ok: false as const,
+            status: 409,
+            payload: { error: 'An account with this email already exists.' },
+          };
+        }
+
+        const nowIso = new Date().toISOString();
+        const userId =
+          requestedRole === 'super_admin'
+            ? `sup_${crypto.randomBytes(6).toString('hex')}`
+            : `adm_${crypto.randomBytes(6).toString('hex')}`;
+
+        const adminUser: StoredUserRecord = {
+          id: userId,
+          email: (body.email || '').trim(),
+          normalizedEmail: emailCheck.normalized,
+          displayName: nameCheck.clean,
+          passwordHash: hashPassword(body.password || ''),
+          role: requestedRole,
+          emailVerified: true,
+          status: 'active',
+          policyVersion: POLICY_VERSION,
+          termsAcceptedAt: nowIso,
+          failedLoginAttempts: 0,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        };
+
+        lockedDb.users[userId] = adminUser;
+        lockedDb.emailIndex[emailCheck.normalized] = userId;
+        if (requestedRole === 'super_admin') {
+          lockedDb.adminBootstrap = {
+            ...(lockedDb.adminBootstrap || { initialized: true, secretConsumed: true }),
+            initialized: true,
+            secretConsumed: true,
+          };
+        }
+
+        recordAuditEvent(lockedDb, {
+          eventType: 'ADMIN_ACTION',
+          actorId: freshActor.id,
+          actorRole: freshActor.role,
+          actionType: requestedRole === 'super_admin' ? 'SUPER_ADMIN_CREATED' : 'ADMIN_ACCOUNT_CREATED',
+          recordType: 'user',
+          recordId: userId,
+          newValue: `${emailCheck.normalized}:${requestedRole}`,
+          outcome: 'success',
+          ip,
+          summary: `Super Admin created ${requestedRole} account (${emailCheck.normalized})`,
+        });
+
+        return {
+          ok: true as const,
+          status: 201,
+          payload: { admin: toSafeUser(adminUser) },
+        };
+      });
+
+      return res.status(outcome.status).json(outcome.payload);
+    } catch (err) {
+      console.error('Admin creation error:', (err as Error)?.message || err);
+      return res.status(503).json({
+        error: 'Database unavailable. Failing closed for data safety.',
+        code: 'DB_UNAVAILABLE',
+      });
+    }
   });
 
   app.patch('/api/admin/admins/:userId/status', requireStrictSuperAdmin, (req: AuthenticatedRequest, res) => {
@@ -650,12 +755,22 @@ export function registerAdminRoutes(deps: AdminRoutesDeps): void {
     if (!target || !isAdminRole(target.role)) {
       return res.status(404).json({ error: 'Administrator account not found' });
     }
-    if (target.id === req.authSession!.user.id || target.role === 'super_admin') {
-      return res.status(403).json({ error: 'Cannot suspend the primary Super Admin account.' });
+    if (target.id === req.authSession!.user.id) {
+      return res.status(403).json({ error: 'You cannot suspend or deactivate your own administrator account.' });
     }
     const { status } = (req.body || {}) as { status?: AccountStatus };
     if (status !== 'active' && status !== 'suspended') {
       return res.status(400).json({ error: 'Status must be active or suspended.' });
+    }
+    if (target.role === 'super_admin' && status === 'suspended') {
+      const otherActiveSupers = Object.values(db.users).filter(
+        (u) => u.id !== target.id && u.role === 'super_admin' && u.status === 'active',
+      );
+      if (otherActiveSupers.length === 0) {
+        return res.status(403).json({
+          error: 'Cannot suspend the last remaining active Super Admin account.',
+        });
+      }
     }
     const prev = target.status;
     target.status = status;

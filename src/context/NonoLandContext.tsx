@@ -57,7 +57,7 @@ import {
 } from '../types/nonoland';
 import { migrateChildProfileSafely } from '../utils/ageAdaptation';
 import { soundEngine } from '../utils/soundEngine';
-import { DEFAULT_FEATURE_FLAGS } from '../utils/validation';
+import { DEFAULT_FEATURE_FLAGS, formatApiErrorMessage } from '../utils/validation';
 
 export interface AuthSessionState {
   authenticated: boolean;
@@ -622,14 +622,24 @@ export const NonoLandProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ accessCode, pin }),
       });
-      const data = (await res.json()) as {
+      const data = (await res.json().catch(() => ({}))) as {
         user?: ParentAccount;
         child?: ChildProfile;
         csrfToken?: string;
         error?: string;
+        code?: string;
       };
       if (!res.ok || !data.user || !data.child) {
-        return { ok: false, error: data.error || 'Invalid child access code or PIN.' };
+        return {
+          ok: false,
+          error: formatApiErrorMessage(
+            res.status,
+            data,
+            language,
+            'Invalid child access code or PIN.',
+            'رمز دخول الطفل أو الرقم السري غير صحيح.',
+          ),
+        };
       }
       const migratedChild = migrateChildProfileSafely(data.child);
       setAuthSession({
@@ -648,7 +658,13 @@ export const NonoLandProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       setScreen('home');
       return { ok: true };
     } catch {
-      return { ok: false, error: 'Connection failed. Please try again.' };
+      return {
+        ok: false,
+        error:
+          language === 'ar'
+            ? 'تعذر الاتصال بالخادم. يرجى المحاولة مرة أخرى.'
+            : 'Connection failed. Please try again.',
+      };
     }
   };
 
@@ -660,14 +676,24 @@ export const NonoLandProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ childId, pin }),
       });
-      const data = (await res.json()) as {
+      const data = (await res.json().catch(() => ({}))) as {
         user?: ParentAccount;
         child?: ChildProfile;
         csrfToken?: string;
         error?: string;
+        code?: string;
       };
       if (!res.ok || !data.user || !data.child) {
-        return { ok: false, error: data.error || 'Invalid child PIN.' };
+        return {
+          ok: false,
+          error: formatApiErrorMessage(
+            res.status,
+            data,
+            language,
+            'Invalid child PIN.',
+            'الرقم السري للطفل غير صحيح.',
+          ),
+        };
       }
       const migratedChild = migrateChildProfileSafely(data.child);
       setAuthSession({
@@ -686,7 +712,13 @@ export const NonoLandProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       setScreen('home');
       return { ok: true };
     } catch {
-      return { ok: false, error: 'Connection failed. Please try again.' };
+      return {
+        ok: false,
+        error:
+          language === 'ar'
+            ? 'تعذر الاتصال بالخادم. يرجى المحاولة مرة أخرى.'
+            : 'Connection failed. Please try again.',
+      };
     }
   };
 
@@ -708,15 +740,22 @@ export const NonoLandProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         csrfToken?: string;
         dashboardRoute?: string;
         error?: string;
+        code?: string;
       };
       if (!res.ok) {
         return {
           ok: false,
-          error:
-            data.error ||
-            (res.status >= 500
+          error: formatApiErrorMessage(
+            res.status,
+            data,
+            language,
+            res.status >= 500
               ? 'Authentication server is unavailable right now. Please try again.'
-              : 'Invalid email or password.'),
+              : 'Invalid email or password.',
+            res.status >= 500
+              ? 'خادم المصادقة غير متاح حالياً. يرجى المحاولة مرة أخرى.'
+              : 'البريد الإلكتروني أو كلمة المرور غير صحيحة.',
+          ),
         };
       }
       if (!data.user || !resolveDestinationForRole(data.user.role)) {
@@ -816,13 +855,22 @@ export const NonoLandProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         },
         body: JSON.stringify(input),
       });
-      const data = (await res.json()) as {
+      const data = (await res.json().catch(() => ({}))) as {
         child?: ChildProfile;
         accessCode?: string;
         error?: string;
+        code?: string;
       };
       if (!res.ok || !data.child) {
-        throw new Error(data.error || 'Failed to create child profile');
+        throw new Error(
+          formatApiErrorMessage(
+            res.status,
+            data,
+            language,
+            'Failed to create child profile',
+            'تعذر إنشاء ملف الطفل',
+          ),
+        );
       }
       const migratedChild = migrateChildProfileSafely(data.child);
       setPersisted((prev) => ({

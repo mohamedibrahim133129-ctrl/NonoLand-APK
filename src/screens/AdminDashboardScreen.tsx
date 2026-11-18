@@ -5,9 +5,12 @@ import {
   CheckCircle2,
   ClipboardCheck,
   Clock,
+  Database,
   Eye,
+  KeyRound,
   Layers,
   LayoutDashboard,
+  Lock,
   LogOut,
   Plus,
   Search,
@@ -32,7 +35,13 @@ import type {
   TeacherPermission,
   UserRole,
 } from '../types/nonoland';
-import { DEFAULT_TEACHER_PERMISSIONS } from '../utils/validation';
+import {
+  DEFAULT_TEACHER_PERMISSIONS,
+  formatApiErrorMessage,
+  validateEmail,
+  validateParentName,
+  validateStrictAdminPassword,
+} from '../utils/validation';
 
 interface AdminTeacherRow {
   id: string;
@@ -59,6 +68,7 @@ interface AdminTeacherRow {
     suspendedAt?: string;
     suspensionReason?: string;
   };
+  isDevSeed?: boolean;
 }
 
 interface AdminStudentRow {
@@ -69,6 +79,7 @@ interface AdminStudentRow {
   studentUserEmail: string;
   level: number;
   stars: number;
+  isDevSeed?: boolean;
 }
 
 interface AdminParentRow {
@@ -87,7 +98,9 @@ interface AdminParentRow {
     language: string;
     level: number;
     stars: number;
+    isDevSeed?: boolean;
   }>;
+  isDevSeed?: boolean;
 }
 
 interface AdminTeamRow {
@@ -97,6 +110,7 @@ interface AdminTeamRow {
   role: UserRole;
   status: AccountStatus;
   createdAt: string;
+  isDevSeed?: boolean;
 }
 
 interface OverviewStats {
@@ -110,8 +124,23 @@ interface OverviewStats {
   suspendedTeachers: number;
   totalClasses: number;
   activeClasses: number;
+  totalExams: number;
   auditLogsCount: number;
   adminCount: number;
+}
+
+interface OverviewMeta {
+  storageBackend: 'postgresql' | 'in-memory-dev';
+  devSeedEnabled: boolean;
+  seedStats: {
+    totalParents: number;
+    totalFamilies: number;
+    totalChildren: number;
+    totalTeachers: number;
+    totalClasses: number;
+    totalExams: number;
+    auditLogsCount: number;
+  } | null;
 }
 
 type AdminTab =
@@ -119,6 +148,7 @@ type AdminTab =
   | 'requests'
   | 'teachers'
   | 'families'
+  | 'admins'
   | 'classes'
   | 'exams'
   | 'governance'
@@ -142,12 +172,14 @@ export const AdminDashboardScreen: React.FC = () => {
   const [errorMsg, setErrorMsg] = useState('');
 
   const [overviewStats, setOverviewStats] = useState<OverviewStats | null>(null);
+  const [overviewMeta, setOverviewMeta] = useState<OverviewMeta | null>(null);
+  const [statsLoading, setStatsLoading] = useState(true);
   const [teachers, setTeachers] = useState<AdminTeacherRow[]>([]);
   const [students, setStudents] = useState<AdminStudentRow[]>([]);
   const [parents, setParents] = useState<AdminParentRow[]>([]);
   const [adminTeam, setAdminTeam] = useState<AdminTeamRow[]>([]);
-  const [classes, setClasses] = useState<Array<Classroom & { teacherName: string; studentNames: string[] }>>([]);
-  const [teacherExams, setTeacherExams] = useState<Array<TeacherExam & { teacherName: string }>>([]);
+  const [classes, setClasses] = useState<Array<Classroom & { teacherName: string; studentNames: string[]; isDevSeed?: boolean }>>([]);
+  const [teacherExams, setTeacherExams] = useState<Array<TeacherExam & { teacherName: string; isDevSeed?: boolean }>>([]);
 
   // Filters & Modals
   const [teacherSearch, setTeacherSearch] = useState('');
@@ -171,11 +203,21 @@ export const AdminDashboardScreen: React.FC = () => {
   const [newTPassword, setNewTPassword] = useState('');
   const [newTPhone, setNewTPhone] = useState('');
 
-  // Create Admin Form (Super Admin Only)
+  // Create Subordinate Admin Form (Super Admin Only)
   const [newAdmName, setNewAdmName] = useState('');
   const [newAdmEmail, setNewAdmEmail] = useState('');
   const [newAdmPassword, setNewAdmPassword] = useState('');
   const [newAdmRole, setNewAdmRole] = useState<UserRole>('admin');
+
+  // Add Super Admin Modal (Super Admin Only)
+  const [superAdminModalOpen, setSuperAdminModalOpen] = useState(false);
+  const [saName, setSaName] = useState('');
+  const [saEmail, setSaEmail] = useState('');
+  const [saPassword, setSaPassword] = useState('');
+  const [saConfirmPassword, setSaConfirmPassword] = useState('');
+  const [saCreatorPassword, setSaCreatorPassword] = useState('');
+  const [saModalError, setSaModalError] = useState('');
+  const [saSubmitting, setSaSubmitting] = useState(false);
 
   // Create Class Form
   const [newClsName, setNewClsName] = useState('');
@@ -204,6 +246,7 @@ export const AdminDashboardScreen: React.FC = () => {
 
   const loadAdminData = useCallback(async () => {
     if (!isRoleAdmin) return;
+    setStatsLoading(true);
     try {
       const requests: Array<Promise<Response>> = [
         apiFetch('/api/admin/overview-stats'),
@@ -221,6 +264,27 @@ export const AdminDashboardScreen: React.FC = () => {
       if (ovRes?.ok) {
         const d = await ovRes.json();
         setOverviewStats(d.stats || null);
+        setOverviewMeta(
+          d.storageBackend
+            ? {
+                storageBackend: d.storageBackend,
+                devSeedEnabled: Boolean(d.devSeedEnabled),
+                seedStats: d.seedStats || null,
+              }
+            : null,
+        );
+      } else if (ovRes && ovRes.status === 503) {
+        const d = await ovRes.json().catch(() => ({}));
+        setOverviewStats(null);
+        setErrorMsg(
+          formatApiErrorMessage(
+            ovRes.status,
+            d,
+            language,
+            'Database unavailable.',
+            'قاعدة البيانات غير متاحة حالياً.',
+          ),
+        );
       }
       if (tRes?.ok) {
         const d = await tRes.json();
@@ -235,9 +299,15 @@ export const AdminDashboardScreen: React.FC = () => {
       if (pRes?.ok) setParents((await pRes.json()).parents || []);
       if (admRes?.ok) setAdminTeam((await admRes.json()).admins || []);
     } catch {
-      // handled cleanly
+      setErrorMsg(
+        language === 'ar'
+          ? 'تعذر تحميل بيانات لوحة الإدارة من الخادم.'
+          : 'Failed to load admin dashboard data.',
+      );
+    } finally {
+      setStatsLoading(false);
     }
-  }, [apiFetch, newClsTeacherId, isRoleAdmin, isSuperAdmin]);
+  }, [apiFetch, newClsTeacherId, isRoleAdmin, isSuperAdmin, language]);
 
   useEffect(() => {
     void loadAdminData();
@@ -435,7 +505,11 @@ export const AdminDashboardScreen: React.FC = () => {
       }),
     });
     const d = await res.json().catch(() => ({}));
-    if (!res.ok) return setErrorMsg(d.error || 'Could not create admin account');
+    if (!res.ok) {
+      return setErrorMsg(
+        formatApiErrorMessage(res.status, d, language, 'Could not create admin account', 'تعذر إنشاء حساب المسؤول'),
+      );
+    }
     setNotice(
       language === 'ar'
         ? `تم إنشاء حساب المسؤول (${d.admin.email}) بصلاحية ${d.admin.role}`
@@ -445,6 +519,91 @@ export const AdminDashboardScreen: React.FC = () => {
     setNewAdmEmail('');
     setNewAdmPassword('');
     await loadAdminData();
+  };
+
+  const resetSuperAdminModal = () => {
+    setSuperAdminModalOpen(false);
+    setSaName('');
+    setSaEmail('');
+    setSaPassword('');
+    setSaConfirmPassword('');
+    setSaCreatorPassword('');
+    setSaModalError('');
+  };
+
+  const handleCreateSuperAdmin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSaModalError('');
+    const nameCheck = validateParentName(saName);
+    if (!nameCheck.ok) {
+      return setSaModalError(nameCheck.error || (language === 'ar' ? 'الاسم غير صالح.' : 'Invalid full name.'));
+    }
+    const emailCheck = validateEmail(saEmail);
+    if (!emailCheck.ok) {
+      return setSaModalError(emailCheck.error || (language === 'ar' ? 'البريد الإلكتروني غير صالح.' : 'Invalid email address.'));
+    }
+    const pwCheck = validateStrictAdminPassword(saPassword, emailCheck.normalized, nameCheck.clean);
+    if (!pwCheck.ok) {
+      return setSaModalError(
+        pwCheck.error ||
+          (language === 'ar'
+            ? 'كلمة المرور يجب أن تحتوي على ١٢ حرفاً على الأقل مع أحرف كبيرة وصغيرة وأرقام ورموز.'
+            : 'Strong password required (12+ chars, mixed case, number, symbol).'),
+      );
+    }
+    if (saPassword !== saConfirmPassword) {
+      return setSaModalError(language === 'ar' ? 'كلمتا المرور غير متطابقتين.' : 'Password confirmation does not match.');
+    }
+    if (!saCreatorPassword) {
+      return setSaModalError(
+        language === 'ar'
+          ? 'يجب إدخال كلمة المرور الحالية للمشرف العام لتأكيد العملية.'
+          : 'Your current Super Admin password is required to authorize this action.',
+      );
+    }
+
+    setSaSubmitting(true);
+    try {
+      const res = await apiFetch('/api/admin/admins', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          displayName: nameCheck.clean,
+          email: emailCheck.normalized,
+          password: saPassword,
+          confirmPassword: saConfirmPassword,
+          creatorCurrentPassword: saCreatorPassword,
+          role: 'super_admin',
+        }),
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setSaModalError(
+          formatApiErrorMessage(
+            res.status,
+            d,
+            language,
+            'Could not create Super Admin account',
+            'تعذر إنشاء حساب Super Admin',
+          ),
+        );
+        return;
+      }
+      const createdEmail = d.admin?.email || emailCheck.normalized;
+      resetSuperAdminModal();
+      setNotice(
+        language === 'ar'
+          ? `تم إنشاء حساب Super Admin جديد بنجاح: ${createdEmail}`
+          : `New Super Admin created successfully: ${createdEmail}`,
+      );
+      await loadAdminData();
+    } catch {
+      setSaModalError(
+        language === 'ar' ? 'تعذر الاتصال بالخادم.' : 'Network error while creating Super Admin.',
+      );
+    } finally {
+      setSaSubmitting(false);
+    }
   };
 
   const handleCreateClass = async (e: React.FormEvent) => {
@@ -530,17 +689,38 @@ export const AdminDashboardScreen: React.FC = () => {
           },
           {
             id: 'families' as const,
-            label: language === 'ar' ? `الأهل والأطفال (${parents.length})` : `Parents & Children (${parents.length})`,
+            label:
+              language === 'ar'
+                ? `الأهل والأطفال (${overviewStats ? overviewStats.totalParents : parents.filter((p) => !p.isDevSeed).length})`
+                : `Parents & Children (${overviewStats ? overviewStats.totalParents : parents.filter((p) => !p.isDevSeed).length})`,
             icon: <Users className="w-4 h-4" />,
           },
+          ...(isSuperAdmin
+            ? [
+                {
+                  id: 'admins' as const,
+                  label:
+                    language === 'ar'
+                      ? `فريق الإدارة (${adminTeam.length})`
+                      : `Admin Team (${adminTeam.length})`,
+                  icon: <ShieldCheck className="w-4 h-4" />,
+                },
+              ]
+            : []),
           {
             id: 'classes' as const,
-            label: language === 'ar' ? `الفصول والطلاب (${classes.length})` : `Classes (${classes.length})`,
+            label:
+              language === 'ar'
+                ? `الفصول والطلاب (${overviewStats ? overviewStats.totalClasses : classes.filter((c) => !c.isDevSeed).length})`
+                : `Classes (${overviewStats ? overviewStats.totalClasses : classes.filter((c) => !c.isDevSeed).length})`,
             icon: <Layers className="w-4 h-4" />,
           },
           {
             id: 'exams' as const,
-            label: language === 'ar' ? `الامتحانات (${teacherExams.length})` : `Exams (${teacherExams.length})`,
+            label:
+              language === 'ar'
+                ? `الامتحانات (${overviewStats ? overviewStats.totalExams : teacherExams.filter((e) => !e.isDevSeed).length})`
+                : `Exams (${overviewStats ? overviewStats.totalExams : teacherExams.filter((e) => !e.isDevSeed).length})`,
             icon: <ClipboardCheck className="w-4 h-4" />,
           },
           {
@@ -593,6 +773,54 @@ export const AdminDashboardScreen: React.FC = () => {
          =============================================================== */}
       {tab === 'overview' && (
         <div className="space-y-5">
+          {/* Active Storage Backend & Dev-Seed Separation Indicator (Authorized Admin Visibility) */}
+          {overviewMeta && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div
+                className={`p-3.5 rounded-2xl border flex items-center gap-3 text-xs font-bold ${
+                  overviewMeta.storageBackend === 'postgresql'
+                    ? 'bg-[#E2F9EC] border-[#55D98B] text-[#14532D]'
+                    : 'bg-[#FFF3CD] border-[#FFD84D] text-[#78350F]'
+                }`}
+              >
+                <Database className="w-5 h-5 shrink-0" />
+                <div>
+                  <p className="font-extrabold">
+                    {language === 'ar' ? 'محرك التخزين النشط:' : 'Active Storage Backend:'}{' '}
+                    <span className="font-mono-num uppercase">{overviewMeta.storageBackend}</span>
+                  </p>
+                  <p className="opacity-85">
+                    {overviewMeta.storageBackend === 'postgresql'
+                      ? language === 'ar'
+                        ? 'جميع الإحصائيات والسجلات تُقرأ مباشرة من قاعدة بيانات PostgreSQL الدائمة.'
+                        : 'All statistics and records are read directly from persistent PostgreSQL.'
+                      : language === 'ar'
+                        ? 'وضع التطوير المؤقت بالذاكرة (In-Memory Dev) — يتم تفعيله فقط عند عدم تهيئة PostgreSQL.'
+                        : 'Development in-memory storage active because PostgreSQL is not configured in dev mode.'}
+                  </p>
+                </div>
+              </div>
+
+              {overviewMeta.devSeedEnabled && overviewMeta.seedStats && (
+                <div className="p-3.5 rounded-2xl border border-[#8054D9]/35 bg-[#EFE7FF] text-[#4C1D95] text-xs font-bold flex items-start gap-3">
+                  <AlertTriangle className="w-5 h-5 shrink-0 mt-0.5" />
+                  <div>
+                    <p className="font-extrabold">
+                      {language === 'ar'
+                        ? 'بيانات تطوير/تجريبية مفصولة عن الإحصائيات الحقيقية'
+                        : 'Development Seed Baseline Excluded from Real Stats'}
+                    </p>
+                    <p className="opacity-85 mt-0.5">
+                      {language === 'ar'
+                        ? `تم تحميل ${overviewMeta.seedStats.totalParents} حساب ولي أمر، ${overviewMeta.seedStats.totalChildren} طفل، ${overviewMeta.seedStats.totalTeachers} معلم، ${overviewMeta.seedStats.totalClasses} فصل، ${overviewMeta.seedStats.totalExams} امتحان، و${overviewMeta.seedStats.auditLogsCount} سجل تجريبي من ملف التطوير ولا تُحسب ضمن المسجلين الفعليين.`
+                        : `Loaded ${overviewMeta.seedStats.totalParents} parents, ${overviewMeta.seedStats.totalChildren} children, ${overviewMeta.seedStats.totalTeachers} teachers, ${overviewMeta.seedStats.totalClasses} classes, ${overviewMeta.seedStats.totalExams} exams, and ${overviewMeta.seedStats.auditLogsCount} seed logs for dev preview (excluded from real metrics).`}
+                    </p>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
           {pendingTeachers.length > 0 && (
             <div className="p-4 rounded-2xl bg-[#FFF3CD] border-2 border-[#FFD84D] flex flex-wrap items-center justify-between gap-3">
               <div className="flex items-center gap-3">
@@ -620,46 +848,65 @@ export const AdminDashboardScreen: React.FC = () => {
             </div>
           )}
 
+          {overviewStats &&
+            overviewStats.totalParents === 0 &&
+            overviewStats.totalChildren === 0 &&
+            overviewStats.totalTeachers === 0 &&
+            overviewStats.totalClasses === 0 && (
+              <div className="p-4 rounded-2xl bg-white border border-[#27345C]/15 text-center space-y-1">
+                <p className="text-sm font-extrabold text-[#27345C]">
+                  {language === 'ar'
+                    ? 'لا توجد تسجيلات مستخدمين فعلية بعد (الأرقام الفعلية: ٠)'
+                    : 'No real registered users or classes persisted yet'}
+                </p>
+                <p className="text-xs font-semibold text-[#27345C]/65">
+                  {language === 'ar'
+                    ? 'ستتحدث هذه المؤشرات تلقائياً فور تسجيل أولياء الأمور والأطفال والمعلمين الفعليين.'
+                    : 'These counters reflect actual persisted records and will update automatically as real accounts register.'}
+                </p>
+              </div>
+            )}
+
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
             {[
               {
-                label: language === 'ar' ? 'أولياء الأمور / العائلات' : 'Parents / Families',
-                value: overviewStats?.totalParents ?? parents.length,
+                label: language === 'ar' ? 'أولياء الأمور / العائلات (الفعليون)' : 'Real Parents / Families',
+                value: statsLoading && !overviewStats ? '—' : (overviewStats?.totalParents ?? '—'),
                 bg: 'bg-[#E5F6FF] border-[#39BDF2]/40',
               },
               {
-                label: language === 'ar' ? 'ملفات الأطفال (١–٤)' : 'Children (Ages 1–4)',
-                value: overviewStats?.totalChildren ?? students.length,
+                label: language === 'ar' ? 'ملفات الأطفال المسجلة (١–٤)' : 'Real Children (Ages 1–4)',
+                value: statsLoading && !overviewStats ? '—' : (overviewStats?.totalChildren ?? '—'),
                 bg: 'bg-[#EFE7FF] border-[#8054D9]/35',
               },
               {
                 label: language === 'ar' ? 'طلبات معلمين معلّقة' : 'Pending Teachers',
-                value: overviewStats?.pendingTeachers ?? pendingTeachers.length,
+                value: statsLoading && !overviewStats ? '—' : (overviewStats?.pendingTeachers ?? '—'),
                 bg: 'bg-[#FFF3CD] border-[#FFD84D]',
               },
               {
-                label: language === 'ar' ? 'معلمون مفعّلون' : 'Active Teachers',
-                value: overviewStats?.activeTeachers ?? teachers.filter((x) => x.status === 'active').length,
+                label: language === 'ar' ? 'معلمون مفعّلون (الفعليون)' : 'Active Teachers',
+                value: statsLoading && !overviewStats ? '—' : (overviewStats?.activeTeachers ?? '—'),
                 bg: 'bg-[#E2F9EC] border-[#55D98B]',
               },
               {
                 label: language === 'ar' ? 'طلبات مرفوضة' : 'Rejected Requests',
-                value: overviewStats?.rejectedTeachers ?? rejectedTeachers.length,
+                value: statsLoading && !overviewStats ? '—' : (overviewStats?.rejectedTeachers ?? '—'),
                 bg: 'bg-[#FFE8EE] border-[#FF4D6D]/35',
               },
               {
-                label: language === 'ar' ? 'حسابات موقوفة' : 'Suspended Teachers',
-                value: overviewStats?.suspendedTeachers ?? teachers.filter((x) => x.status === 'suspended').length,
-                bg: 'bg-slate-100 border-slate-300',
-              },
-              {
                 label: language === 'ar' ? 'الفصول النشطة' : 'Active Classes',
-                value: overviewStats?.activeClasses ?? classes.filter((c) => c.active).length,
+                value: statsLoading && !overviewStats ? '—' : (overviewStats?.activeClasses ?? '—'),
                 bg: 'bg-white border-[#27345C]/15',
               },
               {
-                label: language === 'ar' ? 'سجلات التدقيق الأمني' : 'Audit Log Entries',
-                value: overviewStats?.auditLogsCount ?? 0,
+                label: language === 'ar' ? 'الامتحانات المسجلة' : 'Real Exams',
+                value: statsLoading && !overviewStats ? '—' : (overviewStats?.totalExams ?? '—'),
+                bg: 'bg-white border-[#27345C]/15',
+              },
+              {
+                label: language === 'ar' ? 'سجلات التدقيق الأمني الفعلية' : 'Real Audit Logs',
+                value: statsLoading && !overviewStats ? '—' : (overviewStats?.auditLogsCount ?? '—'),
                 bg: 'bg-white border-[#27345C]/15',
               },
             ].map((card, i) => (
@@ -987,6 +1234,11 @@ export const AdminDashboardScreen: React.FC = () => {
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="font-extrabold text-sm text-[#27345C]">{tc.name}</span>
                       {renderStatusBadge(tc.status)}
+                      {tc.isDevSeed && (
+                        <span className="px-2 py-0.5 rounded bg-[#FFF3CD] text-[#78350F] text-[10px] font-extrabold">
+                          {language === 'ar' ? 'بيانات تطوير' : 'Dev Seed'}
+                        </span>
+                      )}
                     </div>
                     <p className="text-[#27345C]/70">
                       {tc.email} · {language === 'ar' ? 'الفصول:' : 'Classes:'} {tc.classesCount} ·{' '}
@@ -1091,91 +1343,100 @@ export const AdminDashboardScreen: React.FC = () => {
       )}
 
       {/* ===============================================================
-          TAB 4: PARENTS & CHILDREN + SUPER ADMIN TEAM MANAGEMENT
+          TAB: ADMIN TEAM MANAGEMENT ("فريق الإدارة — Super Admin Only")
          =============================================================== */}
-      {tab === 'families' && (
+      {tab === 'admins' && isSuperAdmin && (
         <div className="space-y-5">
-          {isSuperAdmin && (
-            <div className="nono-card p-5 bg-white space-y-4">
-              <h3 className="text-base font-extrabold text-[#27345C] flex items-center gap-2">
-                <ShieldCheck className="w-5 h-5 text-[#8054D9]" />
-                <span>
+          <div className="nono-card p-5 bg-white space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="text-lg font-extrabold text-[#27345C] flex items-center gap-2">
+                  <ShieldCheck className="w-5 h-5 text-[#8054D9]" />
+                  <span>
+                    {language === 'ar'
+                      ? 'فريق الإدارة — Admin Team'
+                      : 'Admin Team — فريق الإدارة'}
+                  </span>
+                </h2>
+                <p className="text-xs font-semibold text-[#27345C]/65 mt-0.5">
                   {language === 'ar'
-                    ? 'فريق الإدارة (للمشرف العام فقط)'
-                    : 'Administrator Accounts (Super Admin Only)'}
-                </span>
-              </h3>
+                    ? 'إدارة حسابات المشرفين العامين (Super Admin) وأدوار فريق الإدارة المحدودة.'
+                    : 'Manage Super Admin accounts and scoped administrator team members.'}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setSaModalError('');
+                  setSuperAdminModalOpen(true);
+                }}
+                className="nono-btn-tactile px-4 py-2.5 rounded-xl bg-[#8054D9] text-white text-xs font-extrabold flex items-center gap-1.5 cursor-pointer shadow-sm"
+              >
+                <Plus className="w-4 h-4" />
+                <span>{language === 'ar' ? '+ إضافة Super Admin' : '+ Add Super Admin'}</span>
+              </button>
+            </div>
 
-              <form onSubmit={(e) => void handleCreateAdmin(e)} className="grid grid-cols-1 sm:grid-cols-5 gap-2 text-xs font-bold">
-                <input
-                  required
-                  placeholder={language === 'ar' ? 'اسم المسؤول' : 'Admin Name'}
-                  value={newAdmName}
-                  onChange={(e) => setNewAdmName(e.target.value)}
-                  className="h-10 px-3 rounded-xl border border-[#27345C]/20"
-                />
-                <input
-                  required
-                  type="email"
-                  placeholder={language === 'ar' ? 'البريد الإلكتروني' : 'Admin Email'}
-                  value={newAdmEmail}
-                  onChange={(e) => setNewAdmEmail(e.target.value)}
-                  className="h-10 px-3 rounded-xl border border-[#27345C]/20"
-                />
-                <input
-                  required
-                  type="password"
-                  placeholder={language === 'ar' ? 'كلمة مرور قوية (١٢+)' : 'Strong Password (12+)'}
-                  value={newAdmPassword}
-                  onChange={(e) => setNewAdmPassword(e.target.value)}
-                  className="h-10 px-3 rounded-xl border border-[#27345C]/20"
-                />
-                <select
-                  value={newAdmRole}
-                  onChange={(e) => setNewAdmRole(e.target.value as UserRole)}
-                  className="h-10 px-3 rounded-xl border border-[#27345C]/20 bg-white"
-                >
-                  <option value="admin">admin</option>
-                  <option value="content_admin">content_admin</option>
-                  <option value="curriculum_manager">curriculum_manager</option>
-                  <option value="finance_admin">finance_admin</option>
-                  <option value="support_agent">support_agent</option>
-                </select>
-                <button
-                  type="submit"
-                  className="h-10 px-4 rounded-xl bg-[#1F2937] text-white font-extrabold flex items-center justify-center gap-1 cursor-pointer"
-                >
-                  <UserPlus className="w-4 h-4" />
-                  <span>{language === 'ar' ? 'إضافة مسؤول' : 'Create Admin'}</span>
-                </button>
-              </form>
-
-              <div className="space-y-2 text-xs font-bold">
-                {adminTeam.map((adm) => (
+            <div className="space-y-2 text-xs font-bold">
+              {adminTeam.length === 0 ? (
+                <p className="text-center py-6 text-[#27345C]/60">
+                  {language === 'ar' ? 'لا توجد حسابات إدارة مسجلة.' : 'No administrator accounts found.'}
+                </p>
+              ) : (
+                adminTeam.map((adm) => (
                   <div
                     key={adm.id}
-                    className="p-3 rounded-xl bg-[#FFF8E9]/70 border border-[#27345C]/12 flex flex-wrap items-center justify-between gap-2"
+                    className="p-3.5 rounded-xl bg-[#FFF8E9]/70 border border-[#27345C]/12 flex flex-wrap items-center justify-between gap-2"
                   >
-                    <div>
-                      <span className="font-extrabold text-[#27345C]">{adm.name}</span>{' '}
-                      <span className="text-[#27345C]/65">({adm.email})</span>
-                      <span className="ms-2 px-2 py-0.5 rounded bg-[#27345C] text-white text-[10px]">
-                        {adm.role}
-                      </span>
+                    <div className="space-y-0.5">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-extrabold text-sm text-[#27345C]">{adm.name}</span>
+                        <span
+                          className={`px-2 py-0.5 rounded text-[10px] font-extrabold ${
+                            adm.role === 'super_admin'
+                              ? 'bg-[#8054D9] text-white'
+                              : 'bg-[#27345C] text-white'
+                          }`}
+                        >
+                          {adm.role}
+                        </span>
+                        {adm.isDevSeed && (
+                          <span className="px-2 py-0.5 rounded bg-[#FFF3CD] text-[#78350F] text-[10px]">
+                            Dev Seed
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-[#27345C]/65">
+                        {adm.email} · {adm.createdAt ? new Date(adm.createdAt).toLocaleDateString() : '—'}
+                      </p>
                     </div>
                     <div className="flex items-center gap-2">
                       {renderStatusBadge(adm.status)}
-                      {adm.role !== 'super_admin' && (
+                      {adm.id !== authSession.user?.id && (
                         <button
                           type="button"
                           onClick={async () => {
+                            setErrorMsg('');
                             const nextStatus = adm.status === 'active' ? 'suspended' : 'active';
                             const r = await apiFetch(`/api/admin/admins/${adm.id}/status`, {
                               method: 'PATCH',
                               headers: { 'Content-Type': 'application/json' },
                               body: JSON.stringify({ status: nextStatus }),
                             });
-                            if (r.ok) await loadAdminData();
+                            const d = await r.json().catch(() => ({}));
+                            if (!r.ok) {
+                              setErrorMsg(
+                                formatApiErrorMessage(
+                                  r.status,
+                                  d,
+                                  language,
+                                  'Could not update administrator status',
+                                  'تعذر تحديث حالة حساب المشرف',
+                                ),
+                              );
+                              return;
+                            }
+                            await loadAdminData();
                           }}
                           className="px-2.5 py-1 rounded-lg bg-white border border-[#27345C]/20 cursor-pointer"
                         >
@@ -1190,17 +1451,78 @@ export const AdminDashboardScreen: React.FC = () => {
                       )}
                     </div>
                   </div>
-                ))}
-              </div>
+                ))
+              )}
             </div>
-          )}
+          </div>
 
+          <div className="nono-card p-5 bg-white space-y-3">
+            <h3 className="text-sm font-extrabold text-[#27345C] flex items-center gap-2">
+              <UserPlus className="w-4 h-4 text-[#27345C]" />
+              <span>
+                {language === 'ar'
+                  ? 'إضافة عضو إدارة بصلاحيات مخصصة (Subordinate Admin)'
+                  : 'Create Scoped Subordinate Administrator'}
+              </span>
+            </h3>
+            <form onSubmit={(e) => void handleCreateAdmin(e)} className="grid grid-cols-1 sm:grid-cols-5 gap-2 text-xs font-bold">
+              <input
+                required
+                placeholder={language === 'ar' ? 'اسم المسؤول' : 'Admin Name'}
+                value={newAdmName}
+                onChange={(e) => setNewAdmName(e.target.value)}
+                className="h-10 px-3 rounded-xl border border-[#27345C]/20"
+              />
+              <input
+                required
+                type="email"
+                placeholder={language === 'ar' ? 'البريد الإلكتروني' : 'Admin Email'}
+                value={newAdmEmail}
+                onChange={(e) => setNewAdmEmail(e.target.value)}
+                className="h-10 px-3 rounded-xl border border-[#27345C]/20"
+              />
+              <input
+                required
+                type="password"
+                placeholder={language === 'ar' ? 'كلمة مرور قوية (١٢+)' : 'Strong Password (12+)'}
+                value={newAdmPassword}
+                onChange={(e) => setNewAdmPassword(e.target.value)}
+                className="h-10 px-3 rounded-xl border border-[#27345C]/20"
+              />
+              <select
+                value={newAdmRole}
+                onChange={(e) => setNewAdmRole(e.target.value as UserRole)}
+                className="h-10 px-3 rounded-xl border border-[#27345C]/20 bg-white"
+              >
+                <option value="admin">admin</option>
+                <option value="content_admin">content_admin</option>
+                <option value="curriculum_manager">curriculum_manager</option>
+                <option value="finance_admin">finance_admin</option>
+                <option value="support_agent">support_agent</option>
+              </select>
+              <button
+                type="submit"
+                className="h-10 px-4 rounded-xl bg-[#1F2937] text-white font-extrabold flex items-center justify-center gap-1 cursor-pointer"
+              >
+                <UserPlus className="w-4 h-4" />
+                <span>{language === 'ar' ? 'إضافة مسؤول' : 'Create Admin'}</span>
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ===============================================================
+          TAB 4: PARENTS & CHILDREN
+         =============================================================== */}
+      {tab === 'families' && (
+        <div className="space-y-5">
           <div className="nono-card p-5 bg-white space-y-4">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <h3 className="text-base font-extrabold text-[#27345C]">
                 {language === 'ar'
-                  ? `أولياء الأمور والأطفال المسجلون (${parents.length})`
-                  : `Registered Parents & Children (${parents.length})`}
+                  ? `أولياء الأمور والأطفال المسجلون (${parents.filter((p) => !p.isDevSeed).length})`
+                  : `Registered Parents & Children (${parents.filter((p) => !p.isDevSeed).length})`}
               </h3>
               <div className="relative text-xs font-bold">
                 <Search className="w-3.5 h-3.5 text-[#27345C]/50 absolute top-2.5 start-3" />
@@ -1232,6 +1554,11 @@ export const AdminDashboardScreen: React.FC = () => {
                       </div>
                       <div className="flex items-center gap-2">
                         {renderStatusBadge(p.status)}
+                        {p.isDevSeed && (
+                          <span className="px-2 py-0.5 rounded bg-[#FFF3CD] text-[#78350F] text-[10px] font-extrabold">
+                            {language === 'ar' ? 'بيانات تطوير' : 'Dev Seed'}
+                          </span>
+                        )}
                         <span className="px-2 py-0.5 rounded bg-[#EFE7FF] text-[#5B21B6]">
                           {p.childrenCount} {language === 'ar' ? 'طفل' : 'child(ren)'}
                         </span>
@@ -1332,14 +1659,26 @@ export const AdminDashboardScreen: React.FC = () => {
           </form>
 
           <div className="nono-card p-5 bg-white space-y-3">
-            {classes.map((cls) => (
+            {classes.length === 0 ? (
+              <p className="text-center py-6 text-xs font-bold text-[#27345C]/60">
+                {language === 'ar' ? 'لا توجد فصول دراسية مسجلة بعد.' : 'No classes created yet.'}
+              </p>
+            ) : (
+              classes.map((cls) => (
               <div
                 key={cls.id}
                 className="p-4 rounded-2xl border border-[#27345C]/12 bg-[#FFF8E9]/45 space-y-2 text-xs font-bold"
               >
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div>
-                    <h4 className="font-extrabold text-sm text-[#27345C]">{cls.name}</h4>
+                    <div className="flex items-center gap-2">
+                      <h4 className="font-extrabold text-sm text-[#27345C]">{cls.name}</h4>
+                      {cls.isDevSeed && (
+                        <span className="px-2 py-0.5 rounded bg-[#FFF3CD] text-[#78350F] text-[10px] font-extrabold">
+                          {language === 'ar' ? 'بيانات تطوير' : 'Dev Seed'}
+                        </span>
+                      )}
+                    </div>
                     <p>
                       Teacher: {cls.teacherName} · Subject: {cls.subject} · Level: {cls.level}
                     </p>
@@ -1411,7 +1750,8 @@ export const AdminDashboardScreen: React.FC = () => {
                   )}
                 </div>
               </div>
-            ))}
+              ))
+            )}
           </div>
         </div>
       )}
@@ -1424,15 +1764,27 @@ export const AdminDashboardScreen: React.FC = () => {
           <h3 className="text-base font-extrabold text-[#27345C]">
             {language === 'ar' ? 'مراجعة امتحانات المعلمين' : 'Teacher Exams Governance Queue'}
           </h3>
-          {teacherExams.map((ex) => (
+          {teacherExams.length === 0 ? (
+            <p className="text-center py-6 text-xs font-bold text-[#27345C]/60">
+              {language === 'ar' ? 'لا توجد امتحانات معلمين مسجلة بعد.' : 'No teacher exams submitted yet.'}
+            </p>
+          ) : (
+            teacherExams.map((ex) => (
             <div
               key={ex.id}
               className="p-4 rounded-2xl border border-[#27345C]/12 flex flex-wrap justify-between items-center gap-2"
             >
               <div>
-                <p className="font-extrabold text-sm">
-                  {t(ex.title, language)} ({ex.status})
-                </p>
+                <div className="flex items-center gap-2">
+                  <p className="font-extrabold text-sm">
+                    {t(ex.title, language)} ({ex.status})
+                  </p>
+                  {ex.isDevSeed && (
+                    <span className="px-2 py-0.5 rounded bg-[#FFF3CD] text-[#78350F] text-[10px] font-extrabold">
+                      {language === 'ar' ? 'بيانات تطوير' : 'Dev Seed'}
+                    </span>
+                  )}
+                </div>
                 <p>
                   By {ex.teacherName} · L{ex.level} · {ex.subject} · {ex.totalQuestions} Qs
                 </p>
@@ -1468,7 +1820,8 @@ export const AdminDashboardScreen: React.FC = () => {
                 </button>
               </div>
             </div>
-          ))}
+            ))
+          )}
         </div>
       )}
 
@@ -1601,6 +1954,174 @@ export const AdminDashboardScreen: React.FC = () => {
                   : language === 'ar'
                     ? 'تأكيد التعليق'
                     : 'Confirm Suspension'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* ===============================================================
+          MODAL: ADD SUPER ADMIN (SUPER ADMIN ONLY)
+         =============================================================== */}
+      {superAdminModalOpen && isSuperAdmin && (
+        <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4 overflow-y-auto">
+          <form
+            onSubmit={(e) => void handleCreateSuperAdmin(e)}
+            className="nono-card rounded-3xl p-6 bg-white max-w-lg w-full space-y-4 text-xs font-bold my-auto"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <ShieldCheck className="w-5 h-5 text-[#8054D9]" />
+                <h3 className="text-lg font-extrabold text-[#27345C]">
+                  {language === 'ar' ? 'إضافة حساب Super Admin جديد' : 'Create New Super Admin Account'}
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={resetSuperAdminModal}
+                className="px-2.5 py-1 rounded-lg bg-slate-100 text-[#27345C] cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="p-3.5 rounded-2xl bg-[#FFF3CD] border-2 border-[#FFD84D] text-[#78350F] flex items-start gap-2.5">
+              <AlertTriangle className="w-5 h-5 shrink-0 text-[#B45309] mt-0.5" />
+              <p className="font-extrabold leading-relaxed">
+                {language === 'ar'
+                  ? 'حساب Super Admin يمتلك صلاحيات إدارية كاملة على المنصة.'
+                  : 'A Super Admin account has full administrative privileges across the entire platform.'}
+              </p>
+            </div>
+
+            {saModalError && (
+              <div className="p-3 rounded-xl bg-[#FF4D6D]/15 border border-[#FF4D6D]/40 text-[#991B1B] font-extrabold">
+                {saModalError}
+              </div>
+            )}
+
+            <div className="space-y-3">
+              <div>
+                <label className="block mb-1 text-[#27345C]">
+                  {language === 'ar' ? 'الاسم الكامل' : 'Full Name'}
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={saName}
+                  onChange={(e) => setSaName(e.target.value)}
+                  placeholder={language === 'ar' ? 'مثال: أحمد محمد' : 'Full administrator name'}
+                  className="w-full h-10 px-3 rounded-xl border border-[#27345C]/20 bg-[#FFF8E9]/40"
+                />
+              </div>
+
+              <div>
+                <label className="block mb-1 text-[#27345C]">
+                  {language === 'ar' ? 'البريد الإلكتروني' : 'Email Address'}
+                </label>
+                <input
+                  type="email"
+                  required
+                  dir="ltr"
+                  value={saEmail}
+                  onChange={(e) => setSaEmail(e.target.value)}
+                  placeholder="super.admin@domain.com"
+                  className="w-full h-10 px-3 rounded-xl border border-[#27345C]/20 bg-[#FFF8E9]/40"
+                />
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block mb-1 text-[#27345C]">
+                    {language === 'ar' ? 'كلمة المرور' : 'Password'}
+                  </label>
+                  <input
+                    type="password"
+                    required
+                    dir="ltr"
+                    value={saPassword}
+                    onChange={(e) => setSaPassword(e.target.value)}
+                    placeholder="12+ chars (Aa1!)"
+                    className="w-full h-10 px-3 rounded-xl border border-[#27345C]/20 bg-[#FFF8E9]/40"
+                  />
+                </div>
+                <div>
+                  <label className="block mb-1 text-[#27345C]">
+                    {language === 'ar' ? 'تأكيد كلمة المرور' : 'Confirm Password'}
+                  </label>
+                  <input
+                    type="password"
+                    required
+                    dir="ltr"
+                    value={saConfirmPassword}
+                    onChange={(e) => setSaConfirmPassword(e.target.value)}
+                    placeholder="••••••••••••"
+                    className="w-full h-10 px-3 rounded-xl border border-[#27345C]/20 bg-[#FFF8E9]/40"
+                  />
+                </div>
+              </div>
+
+              <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200 text-[11px] text-[#27345C]/75 flex flex-wrap gap-2">
+                <span className={saPassword.length >= 12 ? 'text-[#14532D] font-extrabold' : ''}>
+                  {saPassword.length >= 12 ? '✓' : '○'} {language === 'ar' ? '١٢+ حرفاً' : '12+ chars'}
+                </span>
+                <span className={/[A-Z]/.test(saPassword) && /[a-z]/.test(saPassword) ? 'text-[#14532D] font-extrabold' : ''}>
+                  {/[A-Z]/.test(saPassword) && /[a-z]/.test(saPassword) ? '✓' : '○'}{' '}
+                  {language === 'ar' ? 'حروف كبيرة وصغيرة' : 'Upper & lower'}
+                </span>
+                <span className={/\d/.test(saPassword) ? 'text-[#14532D] font-extrabold' : ''}>
+                  {/\d/.test(saPassword) ? '✓' : '○'} {language === 'ar' ? 'رقم' : 'Number'}
+                </span>
+                <span className={/[^A-Za-z0-9\s]/.test(saPassword) ? 'text-[#14532D] font-extrabold' : ''}>
+                  {/[^A-Za-z0-9\s]/.test(saPassword) ? '✓' : '○'} {language === 'ar' ? 'رمز خاص' : 'Symbol'}
+                </span>
+              </div>
+
+              <div className="pt-1 border-t border-[#27345C]/12">
+                <label className="flex items-center gap-1.5 mb-1 text-[#27345C] font-extrabold">
+                  <Lock className="w-3.5 h-3.5 text-[#8054D9]" />
+                  <span>
+                    {language === 'ar'
+                      ? 'تأكيد كلمة المرور الحالية لحسابك (Super Admin)'
+                      : 'Confirm Your Current Super Admin Password'}
+                  </span>
+                </label>
+                <input
+                  type="password"
+                  required
+                  dir="ltr"
+                  value={saCreatorPassword}
+                  onChange={(e) => setSaCreatorPassword(e.target.value)}
+                  placeholder={language === 'ar' ? 'كلمة مرورك الحالية' : 'Your current password'}
+                  className="w-full h-10 px-3 rounded-xl border-2 border-[#8054D9]/30 bg-white"
+                />
+              </div>
+            </div>
+
+            <div className="flex gap-2 pt-2">
+              <button
+                type="button"
+                onClick={resetSuperAdminModal}
+                disabled={saSubmitting}
+                className="flex-1 h-11 rounded-xl bg-slate-100 text-[#27345C] font-extrabold cursor-pointer disabled:opacity-50"
+              >
+                {language === 'ar' ? 'إلغاء' : 'Cancel'}
+              </button>
+              <button
+                type="submit"
+                disabled={saSubmitting}
+                className="flex-1 h-11 rounded-xl bg-[#8054D9] text-white font-extrabold flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
+              >
+                <KeyRound className="w-4 h-4" />
+                <span>
+                  {saSubmitting
+                    ? language === 'ar'
+                      ? 'جاري الإنشاء...'
+                      : 'Creating...'
+                    : language === 'ar'
+                      ? 'إنشاء Super Admin'
+                      : 'Create Super Admin'}
+                </span>
               </button>
             </div>
           </form>

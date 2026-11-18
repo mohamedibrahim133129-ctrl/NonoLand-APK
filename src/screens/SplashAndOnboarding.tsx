@@ -23,6 +23,7 @@ import { AgeGroupId, ChildProfile, Language } from '../types/nonoland';
 import { UNIFIED_STAGE_ID } from '../utils/ageAdaptation';
 import { soundEngine } from '../utils/soundEngine';
 import {
+  formatApiErrorMessage,
   POLICY_VERSION,
   validateChildProfileInput,
   validateEmail,
@@ -304,9 +305,17 @@ export const ParentAuthScreen: React.FC = () => {
             policyVersion: POLICY_VERSION,
           }),
         });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
         if (!res.ok) {
-          setErrorMsg(data.error || 'Teacher registration failed');
+          setErrorMsg(
+            formatApiErrorMessage(
+              res.status,
+              data,
+              language,
+              'Teacher registration failed',
+              'تعذر إرسال طلب حساب المعلم.',
+            ),
+          );
           soundEngine.playEncourage();
           return;
         }
@@ -362,7 +371,15 @@ export const ParentAuthScreen: React.FC = () => {
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
-          setErrorMsg(data.error || 'Super Admin bootstrap failed');
+          setErrorMsg(
+            formatApiErrorMessage(
+              res.status,
+              data,
+              language,
+              'Super Admin bootstrap failed',
+              'تعذر إكمال تهيئة المشرف العام.',
+            ),
+          );
           if (data.initialized) {
             setAdminBootstrapStatus({ loading: false, initialized: true, setupConfigured: false });
             setMode('admin-login');
@@ -427,9 +444,17 @@ export const ParentAuthScreen: React.FC = () => {
             policyVersion: POLICY_VERSION,
           }),
         });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
         if (!res.ok) {
-          setErrorMsg(data.error || 'Registration failed');
+          setErrorMsg(
+            formatApiErrorMessage(
+              res.status,
+              data,
+              language,
+              'Registration failed',
+              'تعذر إنشاء حساب ولي الأمر.',
+            ),
+          );
           soundEngine.playEncourage();
           return;
         }
@@ -496,7 +521,19 @@ export const ParentAuthScreen: React.FC = () => {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ email }),
         });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          setErrorMsg(
+            formatApiErrorMessage(
+              res.status,
+              data,
+              language,
+              'Could not process password reset request.',
+              'تعذر إرسال طلب استعادة كلمة المرور.',
+            ),
+          );
+          return;
+        }
         setDevNotice(
           data.devResetToken
             ? `${data.message} (Dev token: ${data.devResetToken})`
@@ -525,9 +562,17 @@ export const ParentAuthScreen: React.FC = () => {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ token: resetToken.trim(), newPassword: password }),
         });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
         if (!res.ok) {
-          setErrorMsg(data.error || 'Reset failed');
+          setErrorMsg(
+            formatApiErrorMessage(
+              res.status,
+              data,
+              language,
+              'Reset failed',
+              'تعذر إعادة تعيين كلمة المرور.',
+            ),
+          );
           return;
         }
         soundEngine.playSuccess();
@@ -557,9 +602,17 @@ export const ParentAuthScreen: React.FC = () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token: verifyTokenInput.trim() }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        setErrorMsg(data.error || 'Verification failed');
+        setErrorMsg(
+          formatApiErrorMessage(
+            res.status,
+            data,
+            language,
+            'Verification failed',
+            'تعذر تأكيد البريد الإلكتروني.',
+          ),
+        );
         return;
       }
       soundEngine.playSuccess();

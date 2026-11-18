@@ -121,113 +121,121 @@ export function registerFamilyAuthRoutes({
       return res.status(401).json({ error: 'Invalid child access code or PIN.' });
     }
 
-    const outcome = await runWithPgDbLock(`child-login:${normalizedCode}`, async (db) => {
-      ensureFamilyCollections(db);
-      const codeHash = hashToken(normalizedCode);
-      const childId = db.childAccessCodeIndex?.[codeHash];
-      const cred = childId ? db.childCredentials?.[childId] : undefined;
-      const child = childId ? db.children[childId] : undefined;
+    try {
+      const outcome = await runWithPgDbLock(`child-login:${normalizedCode}`, async (db) => {
+        ensureFamilyCollections(db);
+        const codeHash = hashToken(normalizedCode);
+        const childId = db.childAccessCodeIndex?.[codeHash];
+        const cred = childId ? db.childCredentials?.[childId] : undefined;
+        const child = childId ? db.children[childId] : undefined;
 
-      if (!cred || !child) {
-        return { status: 401, body: { error: 'Invalid child access code or PIN.' } };
-      }
-
-      if (cred.lockedUntil && new Date(cred.lockedUntil).getTime() > Date.now()) {
-        return {
-          status: 423,
-          body: {
-            error: 'Child access is temporarily paused for 5 minutes to stay safe. Ask a parent to check or try shortly.',
-            code: 'CHILD_PIN_LOCKED',
-          },
-        };
-      }
-
-      if (!verifyPassword(pinStr, cred.pinHash)) {
-        cred.failedAttempts = (cred.failedAttempts || 0) + 1;
-        if (cred.failedAttempts >= MAX_FAILED_LOGINS) {
-          cred.lockedUntil = new Date(Date.now() + LOCKOUT_MS).toISOString();
+        if (!cred || !child) {
+          return { status: 401, body: { error: 'Invalid child access code or PIN.' } };
         }
-        cred.updatedAt = new Date().toISOString();
+
+        if (cred.lockedUntil && new Date(cred.lockedUntil).getTime() > Date.now()) {
+          return {
+            status: 423,
+            body: {
+              error: 'Child access is temporarily paused for 5 minutes to stay safe. Ask a parent to check or try shortly.',
+              code: 'CHILD_PIN_LOCKED',
+            },
+          };
+        }
+
+        if (!verifyPassword(pinStr, cred.pinHash)) {
+          cred.failedAttempts = (cred.failedAttempts || 0) + 1;
+          if (cred.failedAttempts >= MAX_FAILED_LOGINS) {
+            cred.lockedUntil = new Date(Date.now() + LOCKOUT_MS).toISOString();
+          }
+          cred.updatedAt = new Date().toISOString();
+          const familyId = ensureChildFamilyAndGarden(db, child);
+          recordFamilyEvent(db, {
+            familyId,
+            category: 'auth',
+            actionType: 'CHILD_LOGIN_FAILED',
+            childId: child.id,
+            childName: child.displayName,
+            severity: cred.failedAttempts >= MAX_FAILED_LOGINS ? 'warning' : 'info',
+            title: { ar: 'محاولة دخول غير صحيحة للطفل', en: 'Failed child PIN attempt' },
+            description: {
+              ar: `محاولة دخول برمز سري غير صحيح لحساب الطفل ${child.displayName}`,
+              en: `Incorrect PIN entered for child profile ${child.displayName}`,
+            },
+            ip,
+            securityEventType: 'CHILD_LOGIN_FAILED',
+          });
+          return { status: 401, body: { error: 'Invalid child access code or PIN.' } };
+        }
+
+        cred.failedAttempts = 0;
+        cred.lockedUntil = undefined;
+        cred.lastLoginAt = new Date().toISOString();
+        cred.updatedAt = cred.lastLoginAt;
+        await clearRateLimitPg(`child-login:${ip}`);
+
         const familyId = ensureChildFamilyAndGarden(db, child);
+        const childUser = ensureLinkedChildUserAccount(db, child.id, familyId, child.displayName);
+
+        // Optional trusted device association if cookie present & valid for this family
+        const cookies = parseCookies(req.headers.cookie);
+        const rawDeviceToken = cookies[DEVICE_COOKIE_NAME];
+        let deviceId: string | undefined;
+        if (rawDeviceToken) {
+          const devTokenHash = hashToken(rawDeviceToken);
+          const dev = Object.values(db.trustedDevices || {}).find(
+            (d) => d.tokenHash === devTokenHash && !d.revoked && d.trusted && d.familyId === familyId,
+          );
+          if (dev) {
+            dev.lastActiveAt = new Date().toISOString();
+            deviceId = dev.id;
+          }
+        }
+
+        const csrfToken = createSessionForUser(childUser, req, res, {
+          sessionKind: 'child',
+          childId: child.id,
+          familyId,
+          deviceId,
+        });
+
         recordFamilyEvent(db, {
           familyId,
           category: 'auth',
-          actionType: 'CHILD_LOGIN_FAILED',
+          actionType: 'CHILD_LOGIN_SUCCESS',
+          actorId: childUser.id,
+          actorName: child.displayName,
+          actorRole: 'child',
           childId: child.id,
           childName: child.displayName,
-          severity: cred.failedAttempts >= MAX_FAILED_LOGINS ? 'warning' : 'info',
-          title: { ar: 'محاولة دخول غير صحيحة للطفل', en: 'Failed child PIN attempt' },
+          deviceId,
+          title: { ar: 'دخول الطفل إلى عالمه التعليمي', en: 'Child signed into learning world' },
           description: {
-            ar: `محاولة دخول برمز سري غير صحيح لحساب الطفل ${child.displayName}`,
-            en: `Incorrect PIN entered for child profile ${child.displayName}`,
+            ar: `دخل الطفل ${child.displayName} باستخدام رمز الدخول والرقم السري`,
+            en: `Child ${child.displayName} signed in using Access Code and PIN`,
           },
           ip,
-          securityEventType: 'CHILD_LOGIN_FAILED',
+          securityEventType: 'CHILD_LOGIN',
         });
-        return { status: 401, body: { error: 'Invalid child access code or PIN.' } };
-      }
 
-      cred.failedAttempts = 0;
-      cred.lockedUntil = undefined;
-      cred.lastLoginAt = new Date().toISOString();
-      cred.updatedAt = cred.lastLoginAt;
-      await clearRateLimitPg(`child-login:${ip}`);
-
-      const familyId = ensureChildFamilyAndGarden(db, child);
-      const childUser = ensureLinkedChildUserAccount(db, child.id, familyId, child.displayName);
-
-      // Optional trusted device association if cookie present & valid for this family
-      const cookies = parseCookies(req.headers.cookie);
-      const rawDeviceToken = cookies[DEVICE_COOKIE_NAME];
-      let deviceId: string | undefined;
-      if (rawDeviceToken) {
-        const devTokenHash = hashToken(rawDeviceToken);
-        const dev = Object.values(db.trustedDevices || {}).find(
-          (d) => d.tokenHash === devTokenHash && !d.revoked && d.trusted && d.familyId === familyId,
-        );
-        if (dev) {
-          dev.lastActiveAt = new Date().toISOString();
-          deviceId = dev.id;
-        }
-      }
-
-      const csrfToken = createSessionForUser(childUser, req, res, {
-        sessionKind: 'child',
-        childId: child.id,
-        familyId,
-        deviceId,
+        return {
+          status: 200,
+          body: {
+            user: toSafeUser(childUser),
+            child: toSafeChildProfile(db, child),
+            csrfToken,
+          },
+        };
       });
 
-      recordFamilyEvent(db, {
-        familyId,
-        category: 'auth',
-        actionType: 'CHILD_LOGIN_SUCCESS',
-        actorId: childUser.id,
-        actorName: child.displayName,
-        actorRole: 'child',
-        childId: child.id,
-        childName: child.displayName,
-        deviceId,
-        title: { ar: 'دخول الطفل إلى عالمه التعليمي', en: 'Child signed into learning world' },
-        description: {
-          ar: `دخل الطفل ${child.displayName} باستخدام رمز الدخول والرقم السري`,
-          en: `Child ${child.displayName} signed in using Access Code and PIN`,
-        },
-        ip,
-        securityEventType: 'CHILD_LOGIN',
+      return res.status(outcome.status).json(outcome.body);
+    } catch (err) {
+      console.error('Child login DB lock error (failing closed):', (err as Error)?.message || err);
+      return res.status(503).json({
+        error: 'Database unavailable. Failing closed for data safety.',
+        code: 'DB_UNAVAILABLE',
       });
-
-      return {
-        status: 200,
-        body: {
-          user: toSafeUser(childUser),
-          child: toSafeChildProfile(db, child),
-          csrfToken,
-        },
-      };
-    });
-
-    return res.status(outcome.status).json(outcome.body);
+    }
   });
 
   // 2. TRUSTED FAMILY DEVICE PROFILES (Read ONLY server-issued nono_device cookie, strictly scoped to that family)

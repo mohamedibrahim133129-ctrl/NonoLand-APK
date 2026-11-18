@@ -53,7 +53,7 @@ import {
   StoredUserRecord,
   verifyPassword,
 } from './security';
-import { checkRateLimitPg, runWithPgDbLock } from './pgStore';
+import { checkRateLimitPg, getDbStorageInfo, runWithPgDbLock } from './pgStore';
 
 export interface TeacherRoutesDeps {
   app: express.Application;
@@ -778,6 +778,7 @@ export function registerTeacherAndLevel2Routes(deps: TeacherRoutesDeps): void {
   // =========================================================================
   app.get('/api/admin/teachers', requireAdminPermission('manage_lessons'), (_req, res) => {
     const db = getDb();
+    const storageInfo = getDbStorageInfo();
     const teachers = Object.values(db.users)
       .filter((u) => u.role === 'teacher')
       .map((u) => {
@@ -793,6 +794,7 @@ export function registerTeacherAndLevel2Routes(deps: TeacherRoutesDeps): void {
           classesCount: assignedClasses.length,
           questionsCount: Object.values(db.teacherQuestions).filter((q) => q.teacherId === u.id).length,
           examsCount: Object.values(db.teacherExams).filter((e) => e.teacherId === u.id).length,
+          isDevSeed: storageInfo.isDevSeedRecord('users', u.id),
         };
       })
       .sort((a, b) => (String(a.createdAt || '') < String(b.createdAt || '') ? 1 : -1));
@@ -990,6 +992,7 @@ export function registerTeacherAndLevel2Routes(deps: TeacherRoutesDeps): void {
 
   app.get('/api/admin/students', requireAdminPermission('manage_lessons'), (_req, res) => {
     const db = getDb();
+    const storageInfo = getDbStorageInfo();
     const students = Object.values(db.children).map((ch) => {
       const parent = db.users[ch.parentId];
       const studentUser = ch.studentUserId ? db.users[ch.studentUserId] : undefined;
@@ -1003,6 +1006,7 @@ export function registerTeacherAndLevel2Routes(deps: TeacherRoutesDeps): void {
         studentUserEmail: studentUser?.email || '',
         stars: ch.stars,
         level: ch.level,
+        isDevSeed: storageInfo.isDevSeedRecord('children', ch.id),
       };
     });
     res.json({ students });
@@ -1010,10 +1014,12 @@ export function registerTeacherAndLevel2Routes(deps: TeacherRoutesDeps): void {
 
   app.get('/api/admin/classes', requireAdminPermission('manage_lessons'), (_req, res) => {
     const db = getDb();
+    const storageInfo = getDbStorageInfo();
     const classes = Object.values(db.classes).map((cls) => ({
       ...cls,
       teacherName: db.users[cls.teacherId]?.displayName || '',
       studentNames: cls.studentIds.map((sid) => db.children[sid]?.displayName || sid),
+      isDevSeed: storageInfo.isDevSeedRecord('classes', cls.id),
     }));
     res.json({ classes });
   });
@@ -1135,9 +1141,11 @@ export function registerTeacherAndLevel2Routes(deps: TeacherRoutesDeps): void {
 
   app.get('/api/admin/exams', requireAdminPermission('manage_lessons'), (_req, res) => {
     const db = getDb();
+    const storageInfo = getDbStorageInfo();
     const exams = Object.values(db.teacherExams).map((e) => ({
       ...e,
       teacherName: db.users[e.teacherId]?.displayName || '',
+      isDevSeed: storageInfo.isDevSeedRecord('teacherExams', e.id),
     }));
     res.json({ exams });
   });
