@@ -2,6 +2,12 @@ import assert from 'node:assert';
 import crypto from 'node:crypto';
 import { spawn, ChildProcess } from 'node:child_process';
 import { getPgConnectionDiagnostics } from '../src/db/index.ts';
+import {
+  getNonSensitiveDbSettings,
+  getSecret,
+  initializeSecretProvider,
+  resetSecretProviderForTesting,
+} from '../server/secretProvider.ts';
 
 class E2ECookieClient {
   private cookies = new Map<string, string>();
@@ -116,9 +122,39 @@ async function testDiagnosticsConfig() {
     assert.strictEqual(urlDiag.source, 'database_url');
     assert.strictEqual(urlDiag.sslEnabled, true);
     assert.strictEqual(urlDiag.isNeonHost, true);
-    console.log('✓ Test 1 passed: Neon SSL & env diagnostics (SQL_* + DATABASE_URL fallback)');
+
+    // Non-sensitive defaults: SQL_DB_NAME=neondb, SQL_PORT=5432, SQL_SSL=true when SQL_DB_NAME is omitted
+    delete process.env.DATABASE_URL;
+    process.env.SQL_HOST = 'ep-example-pooler.us-east-2.aws.neon.tech';
+    process.env.SQL_USER = 'neondb_owner';
+    process.env.SQL_PASSWORD = 'placeholder_password';
+    const defaultedDiag = getPgConnectionDiagnostics();
+    assert.strictEqual(defaultedDiag.configured, true);
+    assert.strictEqual(defaultedDiag.sslEnabled, true);
+    const dbDefaults = getNonSensitiveDbSettings();
+    assert.strictEqual(dbDefaults.SQL_DB_NAME, 'neondb');
+    assert.strictEqual(dbDefaults.SQL_PORT, 5432);
+    assert.strictEqual(dbDefaults.SQL_SSL, true);
+
+    // SecretProvider Priority 1 (process.env) -> fail closed when Secret Manager disabled/unavailable
+    resetSecretProviderForTesting();
+    process.env.DISABLE_SECRET_MANAGER = 'true';
+    process.env.SESSION_SECRET = 'test_session_secret_value';
+    delete process.env.NONOLAND_ADMIN_SETUP_SECRET;
+    const spSnap = await initializeSecretProvider();
+    assert.strictEqual(spSnap.secretSource, 'environment');
+    assert.strictEqual(getSecret('SQL_USER'), 'neondb_owner');
+    assert.ok(spSnap.presentRequired.includes('SQL_HOST'));
+    assert.ok(spSnap.presentRequired.includes('SQL_USER'));
+    assert.ok(spSnap.presentRequired.includes('SQL_PASSWORD'));
+    assert.ok(spSnap.presentRequired.includes('SESSION_SECRET'));
+    assert.deepStrictEqual(spSnap.missingRequired, ['NONOLAND_ADMIN_SETUP_SECRET']);
+    assert.ok(spSnap.configurationError && spSnap.configurationError.includes('NONOLAND_ADMIN_SETUP_SECRET'));
+
+    console.log('✓ Test 1 passed: Neon SSL, defaults, SecretProvider priority & env diagnostics');
   } finally {
     process.env = savedEnv;
+    resetSecretProviderForTesting();
   }
 }
 
@@ -162,6 +198,8 @@ async function testProductionFailClosed() {
     const childJson = (await childLoginRes.json()) as Record<string, unknown>;
     assert.strictEqual(childJson.code, 'DB_UNAVAILABLE');
     assert.strictEqual(childJson.error, 'Database unavailable. Failing closed for data safety.');
+    assert.strictEqual(childJson.reason, 'missing_env_vars');
+    assert.ok(Array.isArray(childJson.missingEnvVars));
 
     const parentRegRes = await fetch(`${baseUrl}/api/auth/register`, {
       method: 'POST',
@@ -176,8 +214,13 @@ async function testProductionFailClosed() {
     assert.strictEqual(parentRegRes.status, 503);
     const regJson = (await parentRegRes.json()) as Record<string, unknown>;
     assert.strictEqual(regJson.code, 'DB_UNAVAILABLE');
+    assert.strictEqual(regJson.reason, 'missing_env_vars');
 
-    console.log('✓ Test 2 passed: Production mode fails closed with 503 DB_UNAVAILABLE (no fake login/fallback)');
+    // Public/unauthenticated access to /api/admin/diagnostics MUST be rejected with 401 even when DB is down
+    const unauthDiagRes = await fetch(`${baseUrl}/api/admin/diagnostics`);
+    assert.strictEqual(unauthDiagRes.status, 401);
+
+    console.log('✓ Test 2 passed: Production mode fails closed with 503 DB_UNAVAILABLE & protects admin diagnostics');
   } finally {
     killServer(serverProc);
   }
@@ -443,7 +486,26 @@ async function testDevSeedSeparationAndSuperAdmin() {
     assert.ok(!JSON.stringify(logsRes.data).includes(sa2Pw));
     assert.ok(!JSON.stringify(logsRes.data).includes(super1Pw));
 
-    console.log('✓ Test 3 passed: Dev seed separation & strict Super Admin RBAC/audit verification');
+    // Admin Diagnostics RBAC:
+    // - Unauthenticated -> 401
+    assert.strictEqual((await fetch(`${baseUrl}/api/admin/diagnostics`)).status, 401);
+    // - Non-admin parent -> 403
+    assert.strictEqual((await parentClient.req('GET', '/api/admin/diagnostics')).status, 403);
+    // - Authorized Super Admin -> 200 with safe non-secret metadata
+    const diagRes = await super1.req<{
+      secretSource: string;
+      requiredVariables: { present: string[]; missing: string[] };
+      database: { status: string };
+      postgresError: { classification: string };
+      schemaReady: boolean;
+    }>('GET', '/api/admin/diagnostics');
+    assert.strictEqual(diagRes.status, 200);
+    assert.strictEqual(diagRes.data.database.status, 'in-memory-dev');
+    assert.strictEqual(diagRes.data.postgresError.classification, 'none');
+    assert.strictEqual(diagRes.data.schemaReady, true);
+    assert.ok(!JSON.stringify(diagRes.data).includes(setupSecret), 'Must never leak setupSecret');
+
+    console.log('✓ Test 3 passed: Dev seed separation, Super Admin RBAC, and protected /api/admin/diagnostics');
   } finally {
     killServer(serverProc);
   }

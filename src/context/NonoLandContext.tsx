@@ -181,6 +181,7 @@ interface NonoLandContextValue {
   setParentAccount: (account: ParentAccount) => void;
   authSession: AuthSessionState;
   authResolved: boolean;
+  dbUnavailable: boolean;
   isChildSession: boolean;
   refreshAuthSession: () => Promise<AuthSessionState | null>;
   refreshChildrenList: () => Promise<void>;
@@ -335,6 +336,7 @@ export const NonoLandProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     csrfToken: null,
   });
   const [authResolved, setAuthResolved] = useState(false);
+  const [dbUnavailable, setDbUnavailable] = useState(false);
   const [featureFlags, setFeatureFlags] = useState<FeatureFlags>(DEFAULT_FEATURE_FLAGS);
   const [browserOnline, setBrowserOnline] = useState(
     typeof navigator !== 'undefined' ? navigator.onLine : true,
@@ -376,6 +378,11 @@ export const NonoLandProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     try {
       const res = await fetch('/api/auth/me', { credentials: 'include' });
       if (!res.ok) {
+        if (res.status === 503) {
+          setDbUnavailable(true);
+          return null;
+        }
+        setDbUnavailable(false);
         if (res.status === 401 || res.status === 403) {
           const cleared: AuthSessionState = { authenticated: false, user: null, csrfToken: null };
           setAuthSession(cleared);
@@ -383,6 +390,7 @@ export const NonoLandProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         }
         return null;
       }
+      setDbUnavailable(false);
       const data = (await res.json()) as {
         authenticated: boolean;
         user: ParentAccount | null;
@@ -2453,6 +2461,7 @@ export const NonoLandProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         setParentAccount,
         authSession,
         authResolved,
+        dbUnavailable,
         isChildSession,
         refreshAuthSession,
         refreshChildrenList,

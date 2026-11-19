@@ -150,6 +150,7 @@ export const ParentAuthScreen: React.FC = () => {
     parentAccount,
     refreshAuthSession,
     authSession,
+    dbUnavailable,
     loginWithPassword,
     childLogin,
     childQuickLogin,
@@ -730,9 +731,12 @@ export const ParentAuthScreen: React.FC = () => {
               </p>
             </div>
 
-            {errorMsg && (
+            {(errorMsg || dbUnavailable) && (
               <div className="p-3 rounded-2xl bg-[#FF4D6D]/12 border border-[#FF4D6D]/30 text-xs font-bold text-[#FF4D6D]">
-                {errorMsg}
+                {errorMsg ||
+                  (language === 'ar'
+                    ? 'قاعدة البيانات غير متاحة حالياً — تم إيقاف تسجيل الدخول حفاظاً على أمان البيانات.'
+                    : 'Database unavailable — sign-in is paused safely until PostgreSQL connectivity is restored.')}
               </div>
             )}
 
@@ -1085,9 +1089,12 @@ export const ParentAuthScreen: React.FC = () => {
               </div>
             )}
 
-            {errorMsg && (
+            {(errorMsg || dbUnavailable) && (
               <div className="p-3 rounded-2xl bg-[#FF4D6D]/12 border border-[#FF4D6D]/30 text-xs font-bold text-[#FF4D6D]">
-                {errorMsg}
+                {errorMsg ||
+                  (language === 'ar'
+                    ? 'قاعدة البيانات غير متاحة حالياً — تم إيقاف التسجيل وتسجيل الدخول حفاظاً على أمان البيانات.'
+                    : 'Database unavailable — sign-in and registration are paused safely until PostgreSQL connectivity is restored.')}
               </div>
             )}
 

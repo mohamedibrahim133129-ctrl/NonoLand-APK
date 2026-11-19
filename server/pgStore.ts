@@ -149,6 +149,17 @@ export function isPgConfigured(): boolean {
   return getPgConnectionDiagnostics().configured;
 }
 
+function assertPgConfiguredOrThrow(): void {
+  const diag = getPgConnectionDiagnostics();
+  if (!diag.configured) {
+    const missing =
+      diag.missingEnvVars.length > 0
+        ? diag.missingEnvVars.join(', ')
+        : 'SQL_HOST, SQL_DB_NAME, SQL_USER, SQL_PASSWORD';
+    throw new Error(`PostgreSQL is required in this mode, but missing required secret(s): ${missing}`);
+  }
+}
+
 export function shouldUsePgOrFailClosed(): boolean {
   if (process.env.NODE_ENV === 'production') return true;
   if (process.env.REQUIRE_POSTGRES === 'true') return true;
@@ -252,16 +263,51 @@ function getInMemoryDb(): ServerDb {
   return inMemoryDb;
 }
 
+export type PgErrorClassification =
+  | 'none'
+  | 'missing_env_vars'
+  | 'auth_failed'
+  | 'schema_not_initialized'
+  | 'tls_error'
+  | 'connection_failed';
+
 export interface PgHealthDetails {
   healthy: boolean;
   database: 'postgresql' | 'in-memory-dev' | 'unavailable';
-  reason?: 'missing_env_vars' | 'connection_failed' | 'schema_not_initialized';
+  reason?: 'missing_env_vars' | 'auth_failed' | 'connection_failed' | 'schema_not_initialized' | 'tls_error';
   missingEnvVars?: string[];
   sslEnabled: boolean;
   isNeonHost: boolean;
   isPooledEndpoint: boolean;
   schemaReady: boolean;
   errorCode?: string;
+  userEqualsDbName?: boolean;
+}
+
+function scrubSafePgMessage(message?: string): string {
+  return String(message || 'Unknown PostgreSQL error').replace(/postgres(?:ql)?:\/\/[^\s]+/gi, 'postgresql://[REDACTED]');
+}
+
+function classifyPgError(err: unknown): {
+  code: string;
+  reason: 'auth_failed' | 'tls_error' | 'connection_failed' | 'schema_not_initialized';
+} {
+  const safeErr = err as { code?: string; cause?: { code?: string }; message?: string };
+  const code = safeErr?.code || safeErr?.cause?.code || 'CONN_ERROR';
+  const msg = String(safeErr?.message || '');
+  if (code === '28P01' || code === '28000') {
+    return { code, reason: 'auth_failed' };
+  }
+  if (code === '42P01') {
+    return { code, reason: 'schema_not_initialized' };
+  }
+  if (
+    /SELF_SIGNED_CERT|DEPTH_ZERO_SELF_SIGNED_CERT|ERR_TLS|UNABLE_TO_VERIFY_LEAF_SIGNATURE/i.test(code) ||
+    /SSL|TLS|certificate/i.test(msg)
+  ) {
+    return { code, reason: 'tls_error' };
+  }
+  return { code, reason: 'connection_failed' };
 }
 
 export async function checkPgHealthDetailed(): Promise<PgHealthDetails> {
@@ -278,6 +324,11 @@ export async function checkPgHealthDetailed(): Promise<PgHealthDetails> {
   }
 
   const diag = getPgConnectionDiagnostics();
+  const effectiveDbName = (process.env.SQL_DB_NAME || '').trim() || 'neondb';
+  const sameUserAndDb =
+    Boolean((process.env.SQL_USER || '').trim()) &&
+    (process.env.SQL_USER || '').trim() === effectiveDbName;
+
   if (!diag.configured) {
     return {
       healthy: false,
@@ -288,23 +339,32 @@ export async function checkPgHealthDetailed(): Promise<PgHealthDetails> {
       isNeonHost: diag.isNeonHost,
       isPooledEndpoint: diag.isPooledEndpoint,
       schemaReady: false,
+      userEqualsDbName: sameUserAndDb,
     };
   }
 
   try {
     await pool.query('SELECT 1');
   } catch (err) {
-    const safeErr = err as { code?: string; message?: string };
-    console.error(`PostgreSQL connectivity check failed [${safeErr?.code || 'CONN_ERROR'}]:`, safeErr?.message || 'Unknown connection error');
+    const safeErr = err as { message?: string };
+    const classified = classifyPgError(err);
+    console.error(
+      `PostgreSQL connectivity check failed [${classified.code}]:`,
+      scrubSafePgMessage(safeErr?.message),
+      classified.reason === 'auth_failed' && diag.isNeonHost && sameUserAndDb
+        ? '(Hint: SQL_USER currently equals SQL_DB_NAME; on Neon, the default role is usually "neondb_owner" while the database is "neondb".)'
+        : '',
+    );
     return {
       healthy: false,
       database: 'unavailable',
-      reason: 'connection_failed',
+      reason: classified.reason,
       sslEnabled: diag.sslEnabled,
       isNeonHost: diag.isNeonHost,
       isPooledEndpoint: diag.isPooledEndpoint,
       schemaReady: false,
-      errorCode: safeErr?.code || 'CONN_ERROR',
+      errorCode: classified.code,
+      userEqualsDbName: sameUserAndDb,
     };
   }
 
@@ -323,6 +383,7 @@ export async function checkPgHealthDetailed(): Promise<PgHealthDetails> {
         isNeonHost: diag.isNeonHost,
         isPooledEndpoint: diag.isPooledEndpoint,
         schemaReady: false,
+        userEqualsDbName: sameUserAndDb,
       };
     }
     return {
@@ -332,10 +393,14 @@ export async function checkPgHealthDetailed(): Promise<PgHealthDetails> {
       isNeonHost: diag.isNeonHost,
       isPooledEndpoint: diag.isPooledEndpoint,
       schemaReady: true,
+      userEqualsDbName: sameUserAndDb,
     };
   } catch (err) {
     const safeErr = err as { code?: string; message?: string };
-    console.error(`PostgreSQL schema check failed [${safeErr?.code || 'SCHEMA_ERROR'}]:`, safeErr?.message || 'Unknown schema error');
+    console.error(
+      `PostgreSQL schema check failed [${safeErr?.code || 'SCHEMA_ERROR'}]:`,
+      scrubSafePgMessage(safeErr?.message),
+    );
     return {
       healthy: false,
       database: 'unavailable',
@@ -345,6 +410,7 @@ export async function checkPgHealthDetailed(): Promise<PgHealthDetails> {
       isPooledEndpoint: diag.isPooledEndpoint,
       schemaReady: false,
       errorCode: safeErr?.code || 'SCHEMA_ERROR',
+      userEqualsDbName: sameUserAndDb,
     };
   }
 }
@@ -618,9 +684,73 @@ export async function loadServerDbSnapshotPg(runner: PgRunner = pgDb): Promise<P
       pendingCommit: null,
     };
   }
-  if (!isPgConfigured()) {
-    throw new Error('PostgreSQL is required in this mode, but SQL_HOST / SQL_DB_NAME / SQL_USER are not configured.');
+  assertPgConfiguredOrThrow();
+
+  let loadedRows;
+  try {
+    // Preflight a single lightweight query so auth/network errors fail once instead of logging 39 Failed query traces
+    await runner.execute(sql`SELECT 1`);
+    loadedRows = await Promise.all([
+      runner.select().from(schema.families),
+      runner.select().from(schema.users),
+      runner.select().from(schema.guardianMemberships),
+      runner.select().from(schema.guardianInvitations),
+      runner.select().from(schema.trustedDevices),
+      runner.select().from(schema.sessions),
+      runner.select().from(schema.actionTokens),
+      runner.select().from(schema.parentGateCredentials),
+      runner.select().from(schema.children),
+      runner.select().from(schema.childCredentials),
+      runner.select().from(schema.archivedChildren),
+      runner.select().from(schema.contentPolicies),
+      runner.select().from(schema.privacySettings),
+      runner.select().from(schema.privacyConsents),
+      runner.select().from(schema.dataRequests),
+      runner.select().from(schema.familyAuditEvents),
+      runner.select().from(schema.securityLogs),
+      runner.select().from(schema.aiUsageRecords),
+      runner.select().from(schema.aiUsageDaily),
+      runner.select().from(schema.gardenRewardEvents),
+      runner.select().from(schema.customLessons),
+      runner.select().from(schema.customQuestions),
+      runner.select().from(schema.checkoutSessions),
+      runner.select().from(schema.examAttempts),
+      runner.select().from(schema.level1Attempts),
+      runner.select().from(schema.level2Attempts),
+      runner.select().from(schema.smartAssessmentSessions),
+      runner.select().from(schema.certificates),
+      runner.select().from(schema.processedSyncKeys),
+      runner.select().from(schema.classes),
+      runner.select().from(schema.teacherQuestions),
+      runner.select().from(schema.teacherExams),
+      runner.select().from(schema.examAssignments),
+      runner.select().from(schema.assignedExamAttempts),
+      runner.select().from(schema.homeworks),
+      runner.select().from(schema.homeworkSubmissions),
+      runner.select().from(schema.homeworkAttachments),
+      runner.select().from(schema.importBatches),
+      runner.select().from(schema.appConfigs),
+    ]);
+  } catch (err) {
+    const pgCode = (err as { code?: string; cause?: { code?: string } })?.code ||
+      (err as { cause?: { code?: string } })?.cause?.code;
+    if (pgCode === '28P01' || pgCode === '28000') {
+      const authErr = new Error(
+        'PostgreSQL authentication failed (28P01). Verify SQL_USER (on Neon default role is typically "neondb_owner") and SQL_PASSWORD in Secrets.',
+      ) as Error & { code?: string };
+      authErr.code = 'PG_AUTH_FAILED';
+      throw authErr;
+    }
+    if (pgCode === '42P01') {
+      const schemaErr = new Error(
+        'PostgreSQL connected, but schema tables do not exist yet. Run "npm run db:migrate" with Neon Secrets configured.',
+      ) as Error & { code?: string };
+      schemaErr.code = 'SCHEMA_NOT_INITIALIZED';
+      throw schemaErr;
+    }
+    throw err;
   }
+
   const [
     familiesRows,
     usersRows,
@@ -661,47 +791,7 @@ export async function loadServerDbSnapshotPg(runner: PgRunner = pgDb): Promise<P
     homeworkAttachmentRows,
     importBatchRows,
     appConfigRows,
-  ] = await Promise.all([
-    runner.select().from(schema.families),
-    runner.select().from(schema.users),
-    runner.select().from(schema.guardianMemberships),
-    runner.select().from(schema.guardianInvitations),
-    runner.select().from(schema.trustedDevices),
-    runner.select().from(schema.sessions),
-    runner.select().from(schema.actionTokens),
-    runner.select().from(schema.parentGateCredentials),
-    runner.select().from(schema.children),
-    runner.select().from(schema.childCredentials),
-    runner.select().from(schema.archivedChildren),
-    runner.select().from(schema.contentPolicies),
-    runner.select().from(schema.privacySettings),
-    runner.select().from(schema.privacyConsents),
-    runner.select().from(schema.dataRequests),
-    runner.select().from(schema.familyAuditEvents),
-    runner.select().from(schema.securityLogs),
-    runner.select().from(schema.aiUsageRecords),
-    runner.select().from(schema.aiUsageDaily),
-    runner.select().from(schema.gardenRewardEvents),
-    runner.select().from(schema.customLessons),
-    runner.select().from(schema.customQuestions),
-    runner.select().from(schema.checkoutSessions),
-    runner.select().from(schema.examAttempts),
-    runner.select().from(schema.level1Attempts),
-    runner.select().from(schema.level2Attempts),
-    runner.select().from(schema.smartAssessmentSessions),
-    runner.select().from(schema.certificates),
-    runner.select().from(schema.processedSyncKeys),
-    runner.select().from(schema.classes),
-    runner.select().from(schema.teacherQuestions),
-    runner.select().from(schema.teacherExams),
-    runner.select().from(schema.examAssignments),
-    runner.select().from(schema.assignedExamAttempts),
-    runner.select().from(schema.homeworks),
-    runner.select().from(schema.homeworkSubmissions),
-    runner.select().from(schema.homeworkAttachments),
-    runner.select().from(schema.importBatches),
-    runner.select().from(schema.appConfigs),
-  ]);
+  ] = loadedRows;
 
   const snap = getDefaultServerDb();
 
@@ -1445,9 +1535,7 @@ export async function commitServerDbDiffPg(
     await write;
     return;
   }
-  if (!isPgConfigured()) {
-    throw new Error('PostgreSQL is required in this mode, but SQL_HOST / SQL_DB_NAME / SQL_USER are not configured.');
-  }
+  assertPgConfiguredOrThrow();
   const nowIso = new Date().toISOString();
 
   const dFamilies = diffRecordMap(ctx.serializedCache.get('families'), after.families);
@@ -2817,9 +2905,7 @@ export async function runWithPgDbLock<T>(
     inMemoryLockChain = run.catch(() => undefined);
     return run;
   }
-  if (!isPgConfigured()) {
-    throw new Error('PostgreSQL is required in this mode, but SQL_HOST / SQL_DB_NAME / SQL_USER are not configured.');
-  }
+  assertPgConfiguredOrThrow();
   return pgDb.transaction(async (tx) => {
     await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`);
     const freshCtx = await loadServerDbSnapshotPg(tx);
@@ -2868,9 +2954,7 @@ export async function replaceAllDbFromRestorePg(restored: ServerDb): Promise<voi
     }
     return;
   }
-  if (!isPgConfigured()) {
-    throw new Error('PostgreSQL is required in this mode, but SQL_HOST / SQL_DB_NAME / SQL_USER are not configured.');
-  }
+  assertPgConfiguredOrThrow();
   await pgDb.transaction(async (tx) => {
     await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext('global-restore'))`);
     const currentCtx = await loadServerDbSnapshotPg(tx);

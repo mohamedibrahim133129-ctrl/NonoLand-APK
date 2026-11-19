@@ -55,17 +55,21 @@ function resolveSslOption(host: string, urlSslMode?: string | null): PoolConfig[
   return false;
 }
 
+function sanitizePgErrorMessage(msg: string): string {
+  return String(msg || 'Unknown PostgreSQL error').replace(/postgres(?:ql)?:\/\/[^\s]+/gi, 'postgresql://[REDACTED]');
+}
+
 export function getPgConnectionDiagnostics(): PgConnectionDiagnostics {
   const sqlHost = (process.env.SQL_HOST || '').trim();
-  const sqlDb = (process.env.SQL_DB_NAME || '').trim();
+  const explicitSqlDb = (process.env.SQL_DB_NAME || '').trim();
   const sqlUser = (process.env.SQL_USER || '').trim();
   const sqlPassword = (process.env.SQL_PASSWORD || '').trim();
   const dbUrl = (process.env.DATABASE_URL || '').trim();
 
-  if (sqlHost || sqlDb || sqlUser) {
+  if (sqlHost || explicitSqlDb || sqlUser || sqlPassword) {
+    const sqlDb = explicitSqlDb || 'neondb';
     const missing: string[] = [];
     if (!sqlHost) missing.push('SQL_HOST');
-    if (!sqlDb) missing.push('SQL_DB_NAME');
     if (!sqlUser) missing.push('SQL_USER');
     if (!sqlPassword && !isLocalOrSocketHost(sqlHost)) missing.push('SQL_PASSWORD');
     const sslOpt = resolveSslOption(sqlHost);
@@ -125,12 +129,12 @@ function buildPoolConfig(): PoolConfig {
   const idleTimeoutMillis = Number(process.env.SQL_IDLE_TIMEOUT_MS) || 30000;
 
   const sqlHost = (process.env.SQL_HOST || '').trim();
-  const sqlDb = (process.env.SQL_DB_NAME || '').trim();
+  const sqlDb = (process.env.SQL_DB_NAME || '').trim() || 'neondb';
   const sqlUser = (process.env.SQL_USER || '').trim();
   const sqlPassword = process.env.SQL_PASSWORD ?? '';
   const sqlPort = Number(process.env.SQL_PORT) || 5432;
 
-  if (sqlHost || sqlDb || sqlUser) {
+  if (sqlHost || sqlUser || (process.env.SQL_DB_NAME || '').trim()) {
     return {
       host: sqlHost,
       port: sqlPort,
@@ -183,12 +187,26 @@ export const createPool = () => {
 
     global._postgresPool.on('error', (err) => {
       const safeCode = (err as { code?: string })?.code || 'POOL_ERROR';
-      console.error(`PostgreSQL idle pool error [${safeCode}]:`, err.message);
+      console.error(`PostgreSQL idle pool error [${safeCode}]:`, sanitizePgErrorMessage(err.message));
     });
   }
   return global._postgresPool;
 };
 
-export const pool = createPool();
-export const db = drizzle(pool, { schema });
+export function resetPoolForResolvedSecrets(): void {
+  if (global._postgresPool) {
+    const oldPool = global._postgresPool;
+    global._postgresPool = new Pool(buildPoolConfig());
+    global._postgresPool.on('error', (err) => {
+      const safeCode = (err as { code?: string })?.code || 'POOL_ERROR';
+      console.error(`PostgreSQL idle pool error [${safeCode}]:`, sanitizePgErrorMessage(err.message));
+    });
+    pool = global._postgresPool;
+    db = drizzle(pool, { schema });
+    void oldPool.end().catch(() => {});
+  }
+}
+
+export let pool = createPool();
+export let db = drizzle(pool, { schema });
 

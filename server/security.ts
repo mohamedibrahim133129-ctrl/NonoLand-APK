@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import type { NextFunction, Request, Response } from 'express';
 import { AccountStatus, SecurityEventLog, TeacherPermission, TeacherProfile, UserRole } from '../src/types/nonoland';
 import { DEFAULT_TEACHER_PERMISSIONS } from '../src/utils/validation';
+import { getSecret } from './secretProvider';
 
 export { DEFAULT_TEACHER_PERMISSIONS };
 
@@ -323,7 +324,11 @@ export function clearDeviceCookie(res: Response, reqOrSecure: Request | boolean 
 }
 
 function getFieldCipherKey(): Buffer {
-  const seed = process.env.SESSION_SECRET || process.env.ADMIN_PIN || 'nonoland-server-field-key-v1';
+  const secretSeed = getSecret('SESSION_SECRET') || (process.env.ADMIN_PIN || '').trim();
+  if (!secretSeed && process.env.NODE_ENV === 'production') {
+    throw new Error('SESSION_SECRET is required in production mode to encrypt sensitive fields.');
+  }
+  const seed = secretSeed || 'nonoland-server-field-key-v1';
   return crypto.createHash('sha256').update(seed).digest();
 }
 

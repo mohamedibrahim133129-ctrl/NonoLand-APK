@@ -12,6 +12,7 @@ import type { AccountStatus, UserRole } from '../src/types/nonoland';
 import { recordAuditEvent } from './auditLog';
 import type { AuthenticatedRequest, ServerDb } from './dbTypes';
 import { checkRateLimitPg, getDbStorageInfo, runWithPgDbLock } from './pgStore';
+import { getSecret } from './secretProvider';
 import {
   appendSecurityLog,
   getClientIp,
@@ -71,7 +72,7 @@ export function registerAdminRoutes(deps: AdminRoutesDeps): void {
   app.get('/api/auth/admin-bootstrap/status', (_req, res) => {
     const db = getDb();
     const initialized = isBootstrapDone(db);
-    const hasEnvSecret = Boolean((process.env.NONOLAND_ADMIN_SETUP_SECRET || '').trim());
+    const hasEnvSecret = Boolean(getSecret('NONOLAND_ADMIN_SETUP_SECRET'));
     res.json({
       initialized,
       setupConfigured: !initialized && hasEnvSecret,
@@ -112,14 +113,14 @@ export function registerAdminRoutes(deps: AdminRoutesDeps): void {
           };
         }
 
-        const expectedSecret = (process.env.NONOLAND_ADMIN_SETUP_SECRET || '').trim();
+        const expectedSecret = getSecret('NONOLAND_ADMIN_SETUP_SECRET') || '';
         if (!expectedSecret) {
           return {
             ok: false as const,
             status: 503,
             payload: {
               error:
-                'Admin bootstrap secret (NONOLAND_ADMIN_SETUP_SECRET) is not configured in server environment variables.',
+                'Admin bootstrap secret (NONOLAND_ADMIN_SETUP_SECRET) is not configured in server environment or Secret Manager.',
               initialized: false,
             },
           };

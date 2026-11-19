@@ -45,6 +45,7 @@ import {
   setSessionCookie,
   StoredUserRecord,
   verifyPassword,
+  verifySecretTimingSafe,
 } from './server/security';
 import type { AuthenticatedRequest, CheckoutSession, StoredChildRecord } from './server/dbTypes';
 import { registerAdminRoutes } from './server/adminRoutes';
@@ -85,6 +86,13 @@ import {
   runWithPgRequestContext,
   setPgContextDb,
 } from './server/pgStore';
+import {
+  getNonSensitiveDbSettings,
+  getSecret,
+  getSecretProviderSnapshotSync,
+  initializeSecretProvider,
+} from './server/secretProvider';
+import { getPgConnectionDiagnostics, resetPoolForResolvedSecrets } from './src/db/index';
 import {
   DEFAULT_AVATAR_CONFIG,
   DEFAULT_NEXT_MONTH_PLAN,
@@ -153,6 +161,14 @@ function subjectToWorld(subject: ExamSubject): { worldId: WorldId; worldName: Lo
 }
 
 async function startServer() {
+  const secretStartupSnap = await initializeSecretProvider();
+  if (secretStartupSnap.secretSource === 'secret-manager' || secretStartupSnap.secretSource === 'mixed') {
+    resetPoolForResolvedSecrets();
+  }
+  console.log(
+    `[SecretProvider] source=${secretStartupSnap.secretSource} present=${secretStartupSnap.presentRequired.length}/${secretStartupSnap.presentRequired.length + secretStartupSnap.missingRequired.length} missing=${secretStartupSnap.missingRequired.join(',') || 'none'} smStatus=${secretStartupSnap.secretManager.status}`,
+  );
+
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
 
@@ -239,6 +255,7 @@ async function startServer() {
         database: 'unavailable',
         code: 'DB_UNAVAILABLE',
         reason: health.reason || 'connection_failed',
+        ...(health.errorCode ? { errorCode: health.errorCode } : {}),
         missingEnvVars: health.missingEnvVars,
         sslEnabled: health.sslEnabled,
         schemaReady: health.schemaReady,
@@ -264,8 +281,95 @@ async function startServer() {
     '/api/auth/verify-email',
   ]);
 
+  app.get('/api/admin/diagnostics', async (req: AuthenticatedRequest, res) => {
+    let authorizedAdmin = false;
+
+    try {
+      const ctx = await loadServerDbSnapshotPg();
+      const cookies = parseCookies(req.headers.cookie);
+      const rawToken = cookies[SESSION_COOKIE_NAME];
+      if (rawToken) {
+        const tokenHash = hashToken(rawToken);
+        const session = ctx.db.sessions[tokenHash];
+        const now = Date.now();
+        const idleLimit = session?.rememberMe ? SESSION_REMEMBER_MS : SESSION_IDLE_MS;
+        const linkedDeviceRevoked =
+          session?.deviceId && ctx.db.trustedDevices?.[session.deviceId]?.revoked === true;
+        if (
+          session &&
+          !linkedDeviceRevoked &&
+          now < session.expiresAt &&
+          now - session.lastActiveAt < idleLimit
+        ) {
+          const user = ctx.db.users[session.userId];
+          if (user && user.status === 'active') {
+            if (!isAdminRole(user.role)) {
+              return res.status(403).json({ error: 'Forbidden: Administrator role required.' });
+            }
+            authorizedAdmin = true;
+          }
+        }
+      }
+    } catch {
+      // Database may be unavailable; allow emergency admin header authentication below
+    }
+
+    if (!authorizedAdmin) {
+      const expectedSetupSecret = getSecret('NONOLAND_ADMIN_SETUP_SECRET') || '';
+      const providedSetupSecret = String(req.header('x-admin-setup-secret') || '').trim();
+      const configuredPin = process.env.ADMIN_PIN || (!IS_PROD ? '2026' : '');
+      const providedPin = String(req.header('x-admin-pin') || '').trim();
+
+      const validSetupSecret =
+        Boolean(expectedSetupSecret && providedSetupSecret) &&
+        verifySecretTimingSafe(providedSetupSecret, expectedSetupSecret);
+      const validAdminPin =
+        Boolean(configuredPin && providedPin) &&
+        verifySecretTimingSafe(providedPin, configuredPin);
+
+      if (!validSetupSecret && !validAdminPin) {
+        return res.status(401).json({ error: 'Administrator authentication required.' });
+      }
+    }
+
+    let secretSnap = getSecretProviderSnapshotSync();
+    if (secretSnap.secretManager.status === 'not_probed') {
+      secretSnap = await initializeSecretProvider({ forceProbeSecretManager: true });
+    }
+    const health = await checkPgHealthDetailed();
+    const dbDefaults = getNonSensitiveDbSettings();
+
+    return res.json({
+      secretSource: secretSnap.secretSource,
+      secretManager: secretSnap.secretManager,
+      requiredVariables: {
+        present: secretSnap.presentRequired,
+        missing: secretSnap.missingRequired,
+        sources: secretSnap.sources,
+        nonSensitiveDefaults: dbDefaults,
+      },
+      database: {
+        status: health.healthy
+          ? health.database === 'in-memory-dev'
+            ? 'in-memory-dev'
+            : 'connected'
+          : 'unavailable',
+        healthy: health.healthy,
+        sslEnabled: health.sslEnabled,
+        isNeonHost: health.isNeonHost,
+        isPooledEndpoint: health.isPooledEndpoint,
+      },
+      postgresError: {
+        classification: health.healthy ? 'none' : health.reason || 'connection_failed',
+        errorCode: health.errorCode || null,
+        userEqualsDbName: Boolean(health.userEqualsDbName),
+      },
+      schemaReady: health.schemaReady,
+    });
+  });
+
   app.use('/api', async (req: AuthenticatedRequest, res, next) => {
-    if (req.path === '/health') {
+    if (req.path === '/health' || req.path === '/admin/diagnostics') {
       return next();
     }
 
@@ -273,10 +377,21 @@ async function startServer() {
     try {
       ctx = await loadServerDbSnapshotPg();
     } catch (err) {
-      console.error('PostgreSQL request snapshot load failed (failing closed):', err);
+      const diag = getPgConnectionDiagnostics();
+      const errObj = err as { code?: string; message?: string };
+      const reason = !diag.configured
+        ? 'missing_env_vars'
+        : errObj?.code === 'PG_AUTH_FAILED'
+          ? 'auth_failed'
+          : errObj?.code === 'SCHEMA_NOT_INITIALIZED'
+            ? 'schema_not_initialized'
+            : 'connection_failed';
+      console.error(`PostgreSQL request snapshot load failed (failing closed) [${reason}]:`, errObj?.message || err);
       return res.status(503).json({
         error: 'Database unavailable. Failing closed for data safety.',
         code: 'DB_UNAVAILABLE',
+        reason,
+        ...(diag.missingEnvVars.length > 0 ? { missingEnvVars: diag.missingEnvVars } : {}),
       });
     }
 
@@ -2340,7 +2455,7 @@ async function startServer() {
         );
       } else {
         console.error(
-          `[Startup DB] UNAVAILABLE (fail-closed active): reason=${health.reason} missingEnvVars=${(health.missingEnvVars || []).join(',') || 'none'} ssl=${health.sslEnabled} schemaReady=${health.schemaReady}`,
+          `[Startup DB] UNAVAILABLE (fail-closed active): reason=${health.reason} errorCode=${health.errorCode || 'none'} missingEnvVars=${(health.missingEnvVars || []).join(',') || 'none'} ssl=${health.sslEnabled} schemaReady=${health.schemaReady}`,
         );
       }
     });
